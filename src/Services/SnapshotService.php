@@ -134,6 +134,10 @@ class SnapshotService
         $repoUrl = $this->borgRepoUrl($ssh, $serverId, $appName);
         $borgEnv = $this->borgEnv($ssh);
 
+        // Borg cannot init a repo if the parent directory doesn't exist.
+        // Create it via SSH before the first init attempt.
+        $this->remoteExec($ssh, 'mkdir -p ./' . $serverId . '/' . $appName, false);
+
         $this->borgInitIfNeeded($repoUrl, $borgEnv);
 
         $includes = $this->config['source']['files']['include'];
