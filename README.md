@@ -284,8 +284,16 @@ php artisan snapshot-backup:restore --files-only --date=2026-04-01  # local path
 php artisan snapshot-backup:restore --disks-only --date=2026-04-01  # S3/disk sources only
 php artisan snapshot-backup:restore --db-only --date=2026-04-01
 php artisan snapshot-backup:restore --db-only --date=2026-04-01 --dump=db-App-2026-04-01_060000.sql.gz
-php artisan snapshot-backup:restore --files-only --date=2026-04-01 --path=assets/uploads  # partial
+php artisan snapshot-backup:restore --files-only --date=2026-04-01 --path=assets/uploads           # partial (rsync)
+php artisan snapshot-backup:restore --files-only --date=2026-04-01 --path=var/www/myapp/storage/app/public/assets/uploads  # partial (Borg)
+```
 
+> **`--path` on Borg disks:** Borg stores files at their absolute path without a leading slash
+> (e.g. `var/www/myapp/storage/app/public/assets/`). The `--path` value must match that stored
+> prefix — not just the directory name. Run `borg list REPO::ARCHIVE | head` to inspect stored
+> paths. Without `--path`, the full archive is restored and no path knowledge is needed.
+
+```bash
 # Run retention cleanup manually
 php artisan snapshot-backup:cleanup
 php artisan snapshot-backup:cleanup --sync
