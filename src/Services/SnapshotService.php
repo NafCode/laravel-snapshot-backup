@@ -119,6 +119,9 @@ class SnapshotService
         $sftpFileSlotsBase = $sftpBase . '/snapshots/files';
         $sftpSnapCurr      = $sftpFileSlotsBase . '/' . $currSlot;
 
+        // Ensure destination slot directory exists (mkdir -p tolerates re-runs).
+        // --mkpath was dropped; it requires rsync ≥ 3.2.3 which is not available everywhere.
+        $this->remoteExec($ssh, "mkdir -p {$snapCurr}", false);
         // Unlock in case the slot already exists from a same-slot re-run (non-fatal).
         $this->remoteExec($ssh, "chmod -R u+w {$snapCurr}", false);
 
@@ -150,6 +153,18 @@ class SnapshotService
                     excludes: $excludes,
                 );
                 $this->runWithRetry($rsyncCmd, $this->config['rsync']['retry_count'], $this->config['rsync']['retry_delay']);
+            }
+
+            // Disk sources (S3, GCS, etc.) — stream-copied via Flysystem.
+            // Each disk lands in SLOT/{diskname}/ on the backup disk.
+            foreach ($this->config['source']['files']['disks'] ?? [] as $sourceDiskName) {
+                $this->backupDiskSource(
+                    sourceDiskName: $sourceDiskName,
+                    backupDiskName: $diskName,
+                    ssh:            $ssh,
+                    remoteSnapCurr: $snapCurr,
+                    sftpSnapCurr:   $sftpSnapCurr,
+                );
             }
 
             // Update latest symlink (non-fatal — restricted shells may ignore ln).
@@ -223,7 +238,6 @@ class SnapshotService
             '--human-readable',
             '--delete',
             '--delete-excluded',
-            '--mkpath',
             '--stats',
             '-e', $sshCmd,
         );
@@ -310,6 +324,61 @@ class SnapshotService
         }
 
         return $process->getOutput();
+    }
+
+    /**
+     * Stream-copy all files from a Laravel filesystem disk (e.g. S3) into
+     * SLOT/{sourceDiskName}/ on the backup disk.
+     *
+     * No --link-dest deduplication — each slot is a full copy of the source disk.
+     * SSH mkdir -p is called first to ensure the base dir exists on Hetzner before
+     * Flysystem writes (avoids the silent-fail on freshly created SFTP paths).
+     */
+    private function backupDiskSource(
+        string $sourceDiskName,
+        string $backupDiskName,
+        array $ssh,
+        string $remoteSnapCurr,  // SSH path used for mkdir
+        string $sftpSnapCurr,    // Flysystem path (disk root prepended internally)
+    ): void {
+        $sourceDisk   = MediaService::disk($sourceDiskName);
+        $backupDisk   = MediaService::disk($backupDiskName);
+        $sftpDestBase = $sftpSnapCurr . '/' . $sourceDiskName;
+
+        // Ensure the base destination dir exists via SSH before any Flysystem write.
+        $this->remoteExec($ssh, "mkdir -p {$remoteSnapCurr}/{$sourceDiskName}", false);
+
+        $files  = $sourceDisk->allFiles();
+        $copied = 0;
+        $errors = 0;
+
+        foreach ($files as $file) {
+            try {
+                $stream = $sourceDisk->readStream($file);
+                if (!is_resource($stream)) {
+                    continue;
+                }
+                $backupDisk->writeStream("{$sftpDestBase}/{$file}", $stream);
+                fclose($stream);
+                $copied++;
+            } catch (\Throwable $e) {
+                $errors++;
+                Log::channel('backup')->warning(
+                    "disk-source backup: failed to copy '{$file}' from {$sourceDiskName}: " . $e->getMessage()
+                );
+            }
+        }
+
+        Log::channel('backup')->info(
+            "disk-source backup: {$sourceDiskName} → {$backupDiskName}/{$sourceDiskName}"
+            . " copied={$copied} errors={$errors}"
+        );
+
+        if ($errors > 0 && $copied === 0) {
+            throw new \RuntimeException(
+                "disk-source backup failed: no files copied from {$sourceDiskName} ({$errors} errors)"
+            );
+        }
     }
 
     private function parseSnapshotSize(array $ssh, string $remotePath): ?int

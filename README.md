@@ -1,12 +1,13 @@
 # Laravel Snapshot Backup
 
-rsync-based snapshot backup for Laravel applications. Backs up files and databases to remote storage (Hetzner Storage Box, or any SFTP server) with hard-link deduplication, hourly DB dumps, multi-disk mirroring, and full restore support via Artisan commands.
+rsync-based snapshot backup for Laravel applications. Backs up files and databases to remote storage (Hetzner Storage Box, or any SFTP server) with hard-link deduplication, hourly DB dumps, multi-disk mirroring, cloud disk (S3) backup support, and full restore via Artisan commands.
 
 ---
 
 ## Features
 
 - **File snapshots** via rsync with `--link-dest` hard-linking — unchanged files are not re-transferred or re-stored; only deltas consume new space
+- **Cloud disk backup** — S3, GCS, or any Laravel filesystem disk stream-copied into each snapshot slot alongside local paths
 - **Database dumps** — mysqldump piped through gzip, uploaded via rsync (SFTP disks) or Flysystem (S3, local, etc.)
 - **Multi-disk mirroring** — write to multiple backup destinations on every run
 - **Retention cleanup** — configurable per-type retention window (default 30 days)
@@ -24,12 +25,10 @@ rsync-based snapshot backup for Laravel applications. Backs up files and databas
 | PHP | 8.2+ |
 | Laravel | 10+ or 11+ |
 | MySQL | 5.7+ (for mysqldump) |
-| rsync | 3.2.3+ (needs `--mkpath` support; both app server and remote must have it) |
+| rsync | Any version (no `--mkpath` — remote directories are created via SSH `mkdir -p` before each rsync run) |
 | sshpass | Any (only required if using password-based SSH auth; not needed for SSH key auth) |
 | Redis | Any (recommended for the dedicated backup queue) |
 | spatie/laravel-medialibrary | ^10.0 or ^11.0 |
-
-> **rsync 3.2.3+** is required for `--mkpath`. Ubuntu 22.04+ ships with rsync 3.2.7. Check with `rsync --version`.
 
 > **sshpass** is only needed if your storage disk uses password authentication. Install with `apt install sshpass`. SSH key auth is recommended for production — no extra package, no password in process arguments.
 
@@ -71,6 +70,39 @@ SNAPSHOT_BACKUP_ALERT_MAIL=ops@example.com,devteam@example.com
 ```
 
 The `server_id` and `app_name` are derived automatically from `APP_URL` and `APP_NAME` — no extra config needed for basic usage.
+
+### Source files
+
+By default the package backs up local filesystem paths via rsync. If your uploads live on S3 (or any other Laravel disk), add those disks to `source.files.disks`:
+
+```php
+// config/snapshot-backup.php
+'source' => [
+    'files' => [
+        // Local paths — rsync with --link-dest deduplication
+        'include' => [
+            storage_path('app/public'),
+        ],
+
+        // Laravel disks — stream-copied into SLOT/{diskname}/ on every run
+        // Use when uploads live on S3 or another remote disk
+        'disks' => [
+            // 's3',
+        ],
+
+        'exclude' => [ ... ],
+    ],
+],
+```
+
+You can mix both: local paths go via rsync (with deduplication), disk sources go via Flysystem stream copy (full copy each run, no deduplication). Each disk's files land in `SLOT/{diskname}/` inside the snapshot slot.
+
+If your application already uses `FILESYSTEM_CLOUD_STATUS` to switch between local and S3, you can make the backup source auto-detect:
+
+```php
+'include' => config('filesystems.cloud_status') ? [] : [storage_path('app/public')],
+'disks'   => config('filesystems.cloud_status') ? ['s3'] : [],
+```
 
 ### Storage disk (filesystems.php)
 
@@ -238,9 +270,10 @@ php artisan snapshot-backup:cleanup --sync
 ├── latest -> snapshots/files/2026-04-06_060000   (symlink)
 └── snapshots/
     ├── files/
-    │   ├── 2026-04-06_060000/    ← one slot per backup run
-    │   │   └── assets/           ← named after the source directory
-    │   ├── 2026-04-06_000000/    ← ~95% hard-linked to previous slot
+    │   ├── 2026-04-06_060000/        ← one slot per backup run
+    │   │   ├── public/               ← local path (named after source dir)
+    │   │   └── s3/                   ← disk source (named after disk)
+    │   ├── 2026-04-06_000000/        ← local paths ~95% hard-linked to prev slot
     │   └── ...  (30 days retained)
     └── db/
         ├── 2026-04-06/
@@ -253,16 +286,18 @@ php artisan snapshot-backup:cleanup --sync
 ### File backup
 
 1. Finds the most recent previous slot on the remote via SFTP directory listing
-2. Runs rsync with `--link-dest=../PREV_SLOT/` — unchanged files are hard-linked, not re-transferred
-3. Applies read-only lock (`chmod -R a-w`) after success
-4. Retries up to 3× on failure (rsync exit code 24 — vanished source files — is treated as success)
+2. Creates the destination slot directory on the remote via SSH `mkdir -p`
+3. Runs rsync with `--link-dest=../PREV_SLOT/` — unchanged files are hard-linked, not re-transferred
+4. Stream-copies any configured `source.files.disks` (S3, etc.) into `SLOT/{diskname}/` via Flysystem
+5. Applies read-only lock (`chmod -R a-w`) after success
+6. Retries up to 3× on failure (rsync exit code 24 — vanished source files — is treated as success)
 
 ### Database backup
 
 1. `mysqldump --single-transaction | gzip --best` → local temp file
 2. Verifies integrity with `gzip -t`
 3. Uploads to each configured disk:
-   - **SFTP disks**: rsync over SSH with `--mkpath` (reliable on first run; Flysystem SFTP `put` silently fails on fresh directories on some hosts)
+   - **SFTP disks**: SSH `mkdir -p` to create the date directory, then rsync over SSH (reliable on all hosts; Flysystem SFTP `put` silently fails on freshly created directories on some hosts)
    - **Other disks** (S3, local): `Storage::disk()->writeStream()`
 4. Cleans up local temp file
 
@@ -355,11 +390,11 @@ HETZNER_PASSWORD=...
 - [ ] `SNAPSHOT_BACKUP_ENABLED=true` in `.env`
 - [ ] Storage disk configured in `config/filesystems.php`
 - [ ] `disks` array in `config/snapshot-backup.php` points to that disk
+- [ ] If backing up S3 uploads: add disk name to `source.files.disks`
 - [ ] `backup` queue connection added to `config/queue.php`
 - [ ] `backup-supervisor` added to `config/horizon.php` (or equivalent queue worker)
 - [ ] `backup` log channel added to `config/logging.php`
 - [ ] `sshpass` installed if using password auth (`apt install sshpass`)
-- [ ] `rsync --version` shows 3.2.3+ on the app server
 - [ ] Smoke test: `php artisan snapshot-backup:run --sync --db-only`
 - [ ] Verify: `php artisan snapshot-backup:list`
 

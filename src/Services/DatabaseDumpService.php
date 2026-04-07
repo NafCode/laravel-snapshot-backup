@@ -109,6 +109,9 @@ class DatabaseDumpService
 
     private function uploadViaRsync(string $localFile, array $ssh, string $remoteDir): void
     {
+        // Ensure remote directory exists. --mkpath was dropped; it requires rsync ≥ 3.2.3.
+        $this->remoteExec($ssh, 'mkdir -p ' . escapeshellarg(rtrim($remoteDir, '/')));
+
         $sshCmd = $this->buildSshInlineCmd($ssh);
 
         $cmd = [];
@@ -120,7 +123,6 @@ class DatabaseDumpService
             'rsync',
             '--archive',
             '--compress',
-            '--mkpath',
             '-e', $sshCmd,
             $localFile,
             "{$ssh['user']}@{$ssh['host']}:{$remoteDir}",
@@ -131,6 +133,27 @@ class DatabaseDumpService
 
         if (!$process->isSuccessful()) {
             throw new \RuntimeException('rsync DB upload failed: ' . trim($process->getErrorOutput()));
+        }
+    }
+
+    private function remoteExec(array $ssh, string $command): void
+    {
+        $useKey  = $ssh['ssh_key'] !== null;
+        $sshArgs = $useKey
+            ? ['-i', $ssh['ssh_key'], '-p', $ssh['port'], '-o', 'StrictHostKeyChecking=accept-new',
+               '-o', 'ConnectTimeout=' . $this->config['rsync']['ssh_timeout'], '-o', 'BatchMode=yes']
+            : ['-p', $ssh['port'], '-o', 'StrictHostKeyChecking=accept-new',
+               '-o', 'ConnectTimeout=' . $this->config['rsync']['ssh_timeout'], '-o', 'BatchMode=no'];
+
+        $cmd = $useKey
+            ? array_merge(['ssh'], $sshArgs, [$ssh['user'] . '@' . $ssh['host'], $command])
+            : array_merge(['sshpass', '-p', $ssh['password'], 'ssh'], $sshArgs, [$ssh['user'] . '@' . $ssh['host'], $command]);
+
+        $process = new Process($cmd, timeout: 30);
+        $process->run();
+
+        if (!$process->isSuccessful()) {
+            throw new \RuntimeException("SSH command failed: {$command}\n" . trim($process->getErrorOutput()));
         }
     }
 

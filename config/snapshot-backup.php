@@ -49,15 +49,25 @@ return [
     |--------------------------------------------------------------------------
     | Source Files
     |--------------------------------------------------------------------------
-    | 'include': directories to snapshot. Each becomes a named sub-directory
-    |            inside the snapshot slot (no trailing slash — rsync places the
-    |            directory itself into the slot).
-    | 'exclude': rsync exclude patterns applied to every include path.
+    | Two independent source types — both end up in the same snapshot slot.
+    |
+    | include  — local filesystem paths, transferred via rsync with
+    |            --link-dest deduplication. Fast; requires SSH access.
+    |
+    | disks    — Laravel filesystem disks (e.g. 's3', 'gcs'), stream-copied
+    |            via Flysystem into SLOT/{diskname}/ on each backup disk.
+    |            Use when uploads live on S3 or another remote disk.
+    |            No deduplication — each slot is a full copy.
+    |
+    | exclude  — rsync exclude patterns, applied to 'include' paths only.
     */
     'source' => [
         'files' => [
             'include' => [
                 storage_path('app/public/assets'),
+            ],
+            'disks' => [
+                // 's3',
             ],
             'exclude' => [
                 '.git/',
