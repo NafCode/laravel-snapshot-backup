@@ -14,8 +14,9 @@ class SnapshotBackupRestoreCommand extends Command
                             {--target=       : Local directory to restore files into. Defaults to app_dir in config.}
                             {--path=         : Partial restore: restore only this sub-path (e.g. storage/app/uploads)}
                             {--db-only       : Restore database only}
-                            {--files-only    : Restore files only}
-                            {--full          : Restore both files and database}
+                            {--files-only    : Restore local file paths only (rsync)}
+                            {--disks-only    : Restore disk sources only (S3, etc. — stream copy back to origin disk)}
+                            {--full          : Restore local files, disk sources, and database}
                             {--dump=         : Specific DB dump filename (defaults to latest for that day)}
                             {--force         : Skip all confirmation prompts (use with caution!)}
                             {--server=       : Override server ID}
@@ -25,7 +26,8 @@ class SnapshotBackupRestoreCommand extends Command
     //   Full restore (latest):        snapshot-backup:restore --full
     //   Full restore (specific date): snapshot-backup:restore --full --date=2026-04-01
     //   Full restore (exact slot):    snapshot-backup:restore --full --date=2026-04-01_120000
-    //   Files only:                   snapshot-backup:restore --files-only --date=2026-04-01
+    //   Local files only:             snapshot-backup:restore --files-only --date=2026-04-01
+    //   Disk sources (S3) only:       snapshot-backup:restore --disks-only --date=2026-04-01
     //   DB only (latest dump):        snapshot-backup:restore --db-only --date=2026-04-01
     //   DB only (specific dump):      snapshot-backup:restore --db-only --date=2026-04-01 --dump=db-App-2026-04-01_060000.sql.gz
     //   Partial (sub-path):           snapshot-backup:restore --files-only --date=2026-04-01 --path=assets/uploads
@@ -41,12 +43,13 @@ class SnapshotBackupRestoreCommand extends Command
     {
         $this->config = config('snapshot-backup');
 
-        $serverId  = $this->option('server') ?? $this->config['server_id'];
-        $appName   = $this->option('app')    ?? $this->config['app_name'];
-        $firstInclude = $this->config['source']['files']['include'][0];
-        $targetDir    = $this->option('target') ?? dirname($firstInclude);
-        $diskName  = $this->option('disk')   ?? $this->config['disks'][0];
-        $disk      = MediaService::disk($diskName);
+        $serverId     = $this->option('server') ?? $this->config['server_id'];
+        $appName      = $this->option('app')    ?? $this->config['app_name'];
+        $includes     = $this->config['source']['files']['include'];
+        $firstInclude = $includes[0] ?? null;
+        $targetDir    = $this->option('target') ?? ($firstInclude ? dirname($firstInclude) : storage_path('app'));
+        $diskName     = $this->option('disk')   ?? $this->config['disks'][0];
+        $disk         = MediaService::disk($diskName);
 
         $snapshotsBase = "{$serverId}/{$appName}/snapshots";
         $fileSlotsBase = "{$snapshotsBase}/files";
@@ -85,11 +88,16 @@ class SnapshotBackupRestoreCommand extends Command
         }
 
         // ── Determine what to restore ─────────────────────────────────────────
-        $doFiles = !$this->option('db-only');
-        $doDb    = !$this->option('files-only');
+        $doFiles = !$this->option('db-only') && !$this->option('disks-only');
+        $doDisks = !$this->option('db-only') && !$this->option('files-only');
+        $doDb    = !$this->option('files-only') && !$this->option('disks-only');
 
         if ($this->option('full')) {
-            $doFiles = $doDb = true;
+            $doFiles = $doDisks = $doDb = true;
+        }
+        if ($this->option('disks-only')) {
+            $doFiles = $doDb = false;
+            $doDisks = true;
         }
 
         // ── File Restore (SFTP/rsync only) ────────────────────────────────────
@@ -99,7 +107,7 @@ class SnapshotBackupRestoreCommand extends Command
             if (($diskConfig['driver'] ?? '') !== 'sftp') {
                 $this->error("File restore requires an SFTP disk (disk '{$diskName}' uses '{$diskConfig['driver']}').");
                 $this->line('For non-SFTP disks, download the slot directory manually from your storage provider.');
-                if (!$doDb) {
+                if (!$doDb && !$doDisks) {
                     return self::FAILURE;
                 }
             } else {
@@ -123,8 +131,6 @@ class SnapshotBackupRestoreCommand extends Command
                         $this->restoreFilesViaSftp($ssh, $remoteSrc, $destPath);
                     }
                 } else {
-                    $includes = $this->config['source']['files']['include'];
-
                     $this->warn("Full file restore from slot: {$fileSlot}");
                     $this->line("Target:  <comment>{$destPath}</comment>");
 
@@ -138,6 +144,38 @@ class SnapshotBackupRestoreCommand extends Command
                             $this->restoreFilesViaSftp($ssh, $remoteSrc, $destPath);
                         }
                     }
+                }
+            }
+        }
+
+        // ── Disk Source Restore (S3, etc. — Flysystem stream copy) ───────────
+        if ($doDisks) {
+            $sourceDiskNames = $this->config['source']['files']['disks'] ?? [];
+
+            if (empty($sourceDiskNames)) {
+                $this->line('No source disks configured — skipping disk restore.');
+            } else {
+                foreach ($sourceDiskNames as $sourceDiskName) {
+                    $sftpSlotDir = "{$fileSlotsBase}/{$fileSlot}/{$sourceDiskName}";
+
+                    if (!$disk->directoryExists($sftpSlotDir)) {
+                        $this->warn("No backup found for disk '{$sourceDiskName}' in slot {$fileSlot} — skipping.");
+                        continue;
+                    }
+
+                    $this->warn("Disk restore: {$sourceDiskName}");
+                    $this->line("Source slot: <comment>{$fileSlot}/{$sourceDiskName}</comment>");
+                    $this->line("Target disk: <comment>{$sourceDiskName}</comment>");
+
+                    if (!$this->option('force') && !$this->confirm(
+                        "Restore all files from backup into disk '{$sourceDiskName}'? Existing files with the same path will be overwritten.",
+                        false
+                    )) {
+                        $this->info("Disk restore for '{$sourceDiskName}' cancelled.");
+                        continue;
+                    }
+
+                    $this->restoreDiskSource($disk, $sftpSlotDir, $sourceDiskName);
                 }
             }
         }
@@ -182,9 +220,50 @@ class SnapshotBackupRestoreCommand extends Command
         $this->line('Post-restore checklist:');
         $this->line('  <comment>php artisan config:clear && php artisan cache:clear</comment>');
         $this->line('  <comment>php artisan migrate --force   (if needed)</comment>');
-        $this->line('  <comment>chown -R www-data:www-data ' . $firstInclude . '</comment>');
+        if ($firstInclude) {
+            $this->line('  <comment>chown -R www-data:www-data ' . $firstInclude . '</comment>');
+        }
 
         return self::SUCCESS;
+    }
+
+    // ── Disk source restore (S3, etc.) ────────────────────────────────────────
+
+    private function restoreDiskSource(
+        \Illuminate\Contracts\Filesystem\Filesystem $backupDisk,
+        string $sftpSlotDir,
+        string $targetDiskName,
+    ): void {
+        $targetDisk = MediaService::disk($targetDiskName);
+        $files      = $backupDisk->allFiles($sftpSlotDir);
+        $prefixLen  = strlen(rtrim($sftpSlotDir, '/')) + 1;
+        $copied     = 0;
+        $errors     = 0;
+
+        $this->info('Restoring ' . count($files) . " file(s) to disk '{$targetDiskName}'...");
+
+        foreach ($files as $backupPath) {
+            $relativePath = substr($backupPath, $prefixLen);
+            try {
+                $stream = $backupDisk->readStream($backupPath);
+                if (!is_resource($stream)) {
+                    $errors++;
+                    continue;
+                }
+                $targetDisk->writeStream($relativePath, $stream);
+                fclose($stream);
+                $copied++;
+            } catch (\Throwable $e) {
+                $errors++;
+                $this->warn("  Failed: {$relativePath} — " . $e->getMessage());
+            }
+        }
+
+        $this->info("Disk '{$targetDiskName}' restored: {$copied} copied, {$errors} errors.");
+
+        if ($errors > 0 && $copied === 0) {
+            throw new \RuntimeException("Disk restore failed: no files copied to '{$targetDiskName}'.");
+        }
     }
 
     // ── File restore via rsync (SFTP only) ────────────────────────────────────
@@ -245,7 +324,7 @@ class SnapshotBackupRestoreCommand extends Command
         }
 
         $db         = $this->config['database'];
-        $dbPassword = $this->promptMysqlPassword($db, $local);
+        $dbPassword = $this->promptMysqlPassword($db);
 
         if ($dbPassword === null) {
             @unlink($local);
@@ -325,7 +404,7 @@ class SnapshotBackupRestoreCommand extends Command
 
     // ── MySQL password prompt (up to 3 attempts) ─────────────────────────────
 
-    private function promptMysqlPassword(array $db, string $localDump): ?string
+    private function promptMysqlPassword(array $db): ?string
     {
         for ($attempt = 1; $attempt <= 3; $attempt++) {
             $password = (string) $this->secret(

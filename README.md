@@ -249,7 +249,8 @@ php artisan snapshot-backup:list --disk=hetzner
 php artisan snapshot-backup:restore --full                          # latest everything
 php artisan snapshot-backup:restore --full --date=2026-04-01       # specific day
 php artisan snapshot-backup:restore --full --date=2026-04-01_120000 # exact slot
-php artisan snapshot-backup:restore --files-only --date=2026-04-01
+php artisan snapshot-backup:restore --files-only --date=2026-04-01  # local paths only (rsync)
+php artisan snapshot-backup:restore --disks-only --date=2026-04-01  # S3/disk sources only
 php artisan snapshot-backup:restore --db-only --date=2026-04-01
 php artisan snapshot-backup:restore --db-only --date=2026-04-01 --dump=db-App-2026-04-01_060000.sql.gz
 php artisan snapshot-backup:restore --files-only --date=2026-04-01 --path=assets/uploads  # partial
