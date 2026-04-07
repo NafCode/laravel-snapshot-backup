@@ -14,7 +14,7 @@ class SnapshotBackupRestoreCommand extends Command
                             {--target=       : Local directory to restore files into. Defaults to app_dir in config.}
                             {--path=         : Partial restore: restore only this sub-path (e.g. storage/app/uploads)}
                             {--db-only       : Restore database only}
-                            {--files-only    : Restore local file paths only (rsync)}
+                            {--files-only    : Restore local file paths only (rsync / borg extract)}
                             {--disks-only    : Restore disk sources only (S3, etc. — stream copy back to origin disk)}
                             {--full          : Restore local files, disk sources, and database}
                             {--dump=         : Specific DB dump filename (defaults to latest for that day)}
@@ -28,10 +28,20 @@ class SnapshotBackupRestoreCommand extends Command
     //   Full restore (exact slot):    snapshot-backup:restore --full --date=2026-04-01_120000
     //   Local files only:             snapshot-backup:restore --files-only --date=2026-04-01
     //   Disk sources (S3) only:       snapshot-backup:restore --disks-only --date=2026-04-01
-    //   DB only (latest dump):        snapshot-backup:restore --db-only --date=2026-04-01
+    //   DB only (latest dump):        snapshot-backup:restore --db-only
+    //   DB only (specific date):      snapshot-backup:restore --db-only --date=2026-04-01
     //   DB only (specific dump):      snapshot-backup:restore --db-only --date=2026-04-01 --dump=db-App-2026-04-01_060000.sql.gz
-    //   Partial (sub-path):           snapshot-backup:restore --files-only --date=2026-04-01 --path=assets/uploads
+    //   Partial restore (rsync disk): snapshot-backup:restore --files-only --date=2026-04-01 --path=assets/uploads
+    //   Partial restore (Borg disk):  snapshot-backup:restore --files-only --date=2026-04-01 --path=var/www/myapp/storage/app/public/assets/uploads
     //
+    // --path on Borg disks:
+    //   Borg stores files at their absolute path without a leading slash, e.g.:
+    //     var/www/myapp/storage/app/public/assets/patient-docs/
+    //   The --path value must match that stored path prefix — not just the directory name.
+    //   Run `borg list REPO::ARCHIVE | head` to inspect stored paths.
+    //   Without --path, the full archive is restored (no path knowledge needed).
+    //
+    // --db-only: does not query file archives — safe even if no file backups have run yet.
     // WARNING: --db-only drops and recreates the target database. Always confirm before proceeding.
     // After restore: php artisan config:clear && php artisan cache:clear
 
@@ -51,40 +61,80 @@ class SnapshotBackupRestoreCommand extends Command
         $diskName     = $this->option('disk')   ?? $this->config['disks'][0];
         $disk         = MediaService::disk($diskName);
 
+        $diskConfig = config("filesystems.disks.{$diskName}");
+        $backend    = $diskConfig['snapshot_backend'] ?? 'rsync';
+
         $snapshotsBase = "{$serverId}/{$appName}/snapshots";
         $fileSlotsBase = "{$snapshotsBase}/files";
         $dbBase        = "{$snapshotsBase}/db";
 
-        // ── Resolve file slot and DB date ─────────────────────────────────────
-        $dateOpt = $this->option('date');
+        // ── Resolve file slot and DB day ──────────────────────────────────────
+        $dateOpt  = $this->option('date');
+        $fileSlot = null;
+        $dbDay    = null;
+        $ssh      = null;
+        $repoUrl  = null;
+        $borgEnv  = [];
 
-        if ($dateOpt && preg_match('/^\d{4}-\d{2}-\d{2}_\d{6}$/', $dateOpt)) {
-            $fileSlot = $dateOpt;
+        $dbOnly = $this->option('db-only') && !$this->option('full');
+
+        if ($dbOnly) {
+            // Derive DB day from --date directly, or default to today.
+            if ($dateOpt && preg_match('/^\d{4}-\d{2}-\d{2}$/', $dateOpt)) {
+                $dbDay = $dateOpt;
+            } elseif ($dateOpt && preg_match('/^\d{4}-\d{2}-\d{2}_\d{6}$/', $dateOpt)) {
+                $dbDay = substr($dateOpt, 0, 10);
+            } else {
+                $dbDay = now()->format('Y-m-d');
+            }
         } else {
-            $allSlots = collect($disk->directories($fileSlotsBase))
-                ->map(fn ($d) => basename($d))
-                ->filter(fn ($d) => preg_match('/^\d{4}-\d{2}-\d{2}_\d{6}$/', $d))
-                ->when($dateOpt, fn ($c) => $c->filter(fn ($s) => str_starts_with($s, $dateOpt)))
-                ->sort()
-                ->values();
+            if ($backend === 'borg') {
+                $ssh     = $this->sshFromDisk($diskConfig);
+                $repoUrl = $this->borgRepoUrl($ssh, $serverId, $appName);
+                $borgEnv = $this->borgEnv($ssh);
 
-            if ($allSlots->isEmpty()) {
-                $label = $dateOpt ? "for date {$dateOpt}" : 'on disk ' . $diskName;
-                $this->error("No file snapshots found {$label}.");
-                return self::FAILURE;
+                $allSlots = $this->listBorgArchives($repoUrl, $borgEnv);
+
+                if ($allSlots->isEmpty()) {
+                    $this->error("No Borg archives found in repo for {$serverId}/{$appName}.");
+                    return self::FAILURE;
+                }
+            } else {
+                $allSlots = collect($disk->directories($fileSlotsBase))
+                    ->map(fn ($d) => basename($d))
+                    ->filter(fn ($d) => preg_match('/^\d{4}-\d{2}-\d{2}_\d{6}$/', $d));
             }
 
-            $fileSlot = $allSlots->last();
-            $this->info("Using file slot: <comment>{$fileSlot}</comment>");
-        }
+            if ($dateOpt && preg_match('/^\d{4}-\d{2}-\d{2}_\d{6}$/', $dateOpt)) {
+                $fileSlot = $allSlots->contains($dateOpt) ? $dateOpt : null;
+                if (!$fileSlot) {
+                    $this->error("Snapshot slot '{$dateOpt}' not found on disk {$diskName}.");
+                    return self::FAILURE;
+                }
+            } else {
+                $filtered = $allSlots
+                    ->when($dateOpt, fn ($c) => $c->filter(fn ($s) => str_starts_with($s, $dateOpt)))
+                    ->sort()
+                    ->values();
 
-        $dbDay = $dateOpt && preg_match('/^\d{4}-\d{2}-\d{2}$/', $dateOpt)
-            ? $dateOpt
-            : substr($fileSlot, 0, 10);
+                if ($filtered->isEmpty()) {
+                    $label = $dateOpt ? "for date {$dateOpt}" : 'on disk ' . $diskName;
+                    $this->error("No file snapshots found {$label}.");
+                    return self::FAILURE;
+                }
 
-        if (!$disk->directoryExists("{$fileSlotsBase}/{$fileSlot}")) {
-            $this->error("File slot not found: {$fileSlot} on disk {$diskName}");
-            return self::FAILURE;
+                $fileSlot = $filtered->last();
+                $this->info("Using snapshot slot: <comment>{$fileSlot}</comment>");
+            }
+
+            $dbDay = $dateOpt && preg_match('/^\d{4}-\d{2}-\d{2}$/', $dateOpt)
+                ? $dateOpt
+                : substr($fileSlot, 0, 10);
+
+            if ($backend !== 'borg' && !$disk->directoryExists("{$fileSlotsBase}/{$fileSlot}")) {
+                $this->error("File slot not found: {$fileSlot} on disk {$diskName}");
+                return self::FAILURE;
+            }
         }
 
         // ── Determine what to restore ─────────────────────────────────────────
@@ -100,48 +150,56 @@ class SnapshotBackupRestoreCommand extends Command
             $doDisks = true;
         }
 
-        // ── File Restore (SFTP/rsync only) ────────────────────────────────────
+        // ── File Restore ──────────────────────────────────────────────────────
         if ($doFiles) {
-            $diskConfig = config("filesystems.disks.{$diskName}");
+            if ($backend === 'borg') {
+                $this->warn("File restore from Borg archive: {$fileSlot}");
 
-            if (($diskConfig['driver'] ?? '') !== 'sftp') {
-                $this->error("File restore requires an SFTP disk (disk '{$diskName}' uses '{$diskConfig['driver']}').");
-                $this->line('For non-SFTP disks, download the slot directory manually from your storage provider.');
-                if (!$doDb && !$doDisks) {
-                    return self::FAILURE;
+                if (!$this->option('force') && !$this->confirm('Proceed with file restore?', false)) {
+                    $this->info('File restore cancelled.');
+                } else {
+                    $this->restoreFilesViaBorg($repoUrl, $borgEnv, $fileSlot, $this->option('path'));
                 }
             } else {
-                $ssh        = $this->sshFromDisk($diskConfig);
-                $destPath   = rtrim($targetDir, '/') . '/';
-                $remoteSlot = $ssh['root'] . "/{$fileSlotsBase}/{$fileSlot}";
-
-                if ($this->option('path')) {
-                    $subPath   = ltrim($this->option('path'), '/');
-                    $remoteSrc = $remoteSlot . '/' . $subPath . '/';
-                    $destPath  = $destPath . $subPath . '/';
-                    @mkdir($destPath, 0755, true);
-
-                    $this->warn("Partial restore: {$subPath}");
-                    $this->line("Source:  <comment>{$remoteSrc}</comment>");
-                    $this->line("Target:  <comment>{$destPath}</comment>");
-
-                    if (!$this->option('force') && !$this->confirm('Proceed with file restore?', false)) {
-                        $this->info('File restore cancelled.');
-                    } else {
-                        $this->restoreFilesViaSftp($ssh, $remoteSrc, $destPath);
+                if (($diskConfig['driver'] ?? '') !== 'sftp') {
+                    $this->error("File restore requires an SFTP disk (disk '{$diskName}' uses '{$diskConfig['driver']}').");
+                    $this->line('For non-SFTP disks, download the slot directory manually from your storage provider.');
+                    if (!$doDb && !$doDisks) {
+                        return self::FAILURE;
                     }
                 } else {
-                    $this->warn("Full file restore from slot: {$fileSlot}");
-                    $this->line("Target:  <comment>{$destPath}</comment>");
+                    $ssh        = $this->sshFromDisk($diskConfig);
+                    $destPath   = rtrim($targetDir, '/') . '/';
+                    $remoteSlot = $ssh['root'] . "/{$fileSlotsBase}/{$fileSlot}";
 
-                    if (!$this->option('force') && !$this->confirm('Proceed with file restore?', false)) {
-                        $this->info('File restore cancelled.');
+                    if ($this->option('path')) {
+                        $subPath   = ltrim($this->option('path'), '/');
+                        $remoteSrc = $remoteSlot . '/' . $subPath . '/';
+                        $destPath  = $destPath . $subPath . '/';
+                        @mkdir($destPath, 0755, true);
+
+                        $this->warn("Partial restore: {$subPath}");
+                        $this->line("Source:  <comment>{$remoteSrc}</comment>");
+                        $this->line("Target:  <comment>{$destPath}</comment>");
+
+                        if (!$this->option('force') && !$this->confirm('Proceed with file restore?', false)) {
+                            $this->info('File restore cancelled.');
+                        } else {
+                            $this->restoreFilesViaRsync($ssh, $remoteSrc, $destPath);
+                        }
                     } else {
-                        foreach ($includes as $includePath) {
-                            $subDir    = basename($includePath);
-                            $remoteSrc = $remoteSlot . '/' . $subDir;
-                            $this->line("Restoring: <comment>{$subDir}</comment>");
-                            $this->restoreFilesViaSftp($ssh, $remoteSrc, $destPath);
+                        $this->warn("Full file restore from slot: {$fileSlot}");
+                        $this->line("Target:  <comment>{$destPath}</comment>");
+
+                        if (!$this->option('force') && !$this->confirm('Proceed with file restore?', false)) {
+                            $this->info('File restore cancelled.');
+                        } else {
+                            foreach ($includes as $includePath) {
+                                $subDir    = basename($includePath);
+                                $remoteSrc = $remoteSlot . '/' . $subDir;
+                                $this->line("Restoring: <comment>{$subDir}</comment>");
+                                $this->restoreFilesViaRsync($ssh, $remoteSrc, $destPath);
+                            }
                         }
                     }
                 }
@@ -156,7 +214,7 @@ class SnapshotBackupRestoreCommand extends Command
                 $this->line('No source disks configured — skipping disk restore.');
             } else {
                 foreach ($sourceDiskNames as $sourceDiskName) {
-                    $sftpSlotDir = "{$fileSlotsBase}/{$fileSlot}/{$sourceDiskName}";
+                    $sftpSlotDir = "{$serverId}/{$appName}/snapshots/disk-sources/{$sourceDiskName}/{$fileSlot}";
 
                     if (!$disk->directoryExists($sftpSlotDir)) {
                         $this->warn("No backup found for disk '{$sourceDiskName}' in slot {$fileSlot} — skipping.");
@@ -168,7 +226,7 @@ class SnapshotBackupRestoreCommand extends Command
                     $this->line("Target disk: <comment>{$sourceDiskName}</comment>");
 
                     if (!$this->option('force') && !$this->confirm(
-                        "Restore all files from backup into disk '{$sourceDiskName}'? Existing files with the same path will be overwritten.",
+                        "Restore all files from backup into disk '{$sourceDiskName}'? Existing files will be overwritten.",
                         false
                     )) {
                         $this->info("Disk restore for '{$sourceDiskName}' cancelled.");
@@ -227,6 +285,60 @@ class SnapshotBackupRestoreCommand extends Command
         return self::SUCCESS;
     }
 
+    // ── File restore via Borg extract ─────────────────────────────────────────
+
+    private function restoreFilesViaBorg(
+        string $repoUrl,
+        array $borgEnv,
+        string $archiveName,
+        ?string $subPath,
+    ): void {
+        $cmd = ['borg', 'extract', '--progress', "{$repoUrl}::{$archiveName}"];
+
+        if ($subPath) {
+            $cmd[] = ltrim($subPath, '/');
+        }
+
+        $this->info('Starting borg extract (restores to original absolute paths)...');
+
+        $process = new Process($cmd, '/', $borgEnv, null, 3600);
+        $process->run(function ($_type, $buffer) {
+            $this->output->write($buffer);
+        });
+
+        if (!$process->isSuccessful()) {
+            throw new \RuntimeException('borg extract failed: ' . $process->getErrorOutput());
+        }
+
+        $this->info('Borg file restore complete.');
+    }
+
+    // ── File restore via rsync (SFTP only) ────────────────────────────────────
+
+    private function restoreFilesViaRsync(array $ssh, string $remoteSrc, string $localDest): void
+    {
+        $sshCmd = $this->buildSshCmd($ssh);
+
+        $this->info('Starting rsync restore...');
+
+        $process = new Process([
+            'rsync',
+            '--archive', '--compress', '--human-readable',
+            '--delete', '--stats', '--progress', '--chmod=ugo+rw',
+            '-e', $sshCmd,
+            "{$ssh['user']}@{$ssh['host']}:{$remoteSrc}",
+            $localDest,
+        ], timeout: 3600);
+
+        $process->run(function ($_type, $buffer) {
+            $this->output->write($buffer);
+        });
+
+        if (!$process->isSuccessful()) {
+            throw new \RuntimeException('rsync restore failed: ' . $process->getErrorOutput());
+        }
+    }
+
     // ── Disk source restore (S3, etc.) ────────────────────────────────────────
 
     private function restoreDiskSource(
@@ -263,32 +375,6 @@ class SnapshotBackupRestoreCommand extends Command
 
         if ($errors > 0 && $copied === 0) {
             throw new \RuntimeException("Disk restore failed: no files copied to '{$targetDiskName}'.");
-        }
-    }
-
-    // ── File restore via rsync (SFTP only) ────────────────────────────────────
-
-    private function restoreFilesViaSftp(array $ssh, string $remoteSrc, string $localDest): void
-    {
-        $sshCmd = $this->buildSshCmd($ssh);
-
-        $this->info('Starting rsync restore...');
-
-        $process = new Process([
-            'rsync',
-            '--archive', '--compress', '--human-readable',
-            '--delete', '--stats', '--progress', '--chmod=ugo+rw',
-            '-e', $sshCmd,
-            "{$ssh['user']}@{$ssh['host']}:{$remoteSrc}",
-            $localDest,
-        ], timeout: 3600);
-
-        $process->run(function ($_type, $buffer) {
-            $this->output->write($buffer);
-        });
-
-        if (!$process->isSuccessful()) {
-            throw new \RuntimeException('rsync restore failed: ' . $process->getErrorOutput());
         }
     }
 
@@ -430,7 +516,60 @@ class SnapshotBackupRestoreCommand extends Command
         return null;
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
+    // ── Borg helpers ──────────────────────────────────────────────────────────
+
+    /**
+     * @return \Illuminate\Support\Collection<int, string>
+     */
+    private function listBorgArchives(string $repoUrl, array $borgEnv): \Illuminate\Support\Collection
+    {
+        $process = new Process(['borg', 'list', '--short', $repoUrl], null, $borgEnv, null, 60);
+        $process->run();
+
+        if (!$process->isSuccessful()) {
+            $this->warn('borg list failed: ' . trim($process->getErrorOutput()));
+            return collect();
+        }
+
+        return collect(explode("\n", trim($process->getOutput())))
+            ->filter(fn ($s) => preg_match('/^\d{4}-\d{2}-\d{2}_\d{6}$/', $s))
+            ->values();
+    }
+
+    private function borgRepoUrl(array $ssh, string $serverId, string $appName): string
+    {
+        return "ssh://{$ssh['user']}@{$ssh['host']}:{$ssh['port']}/./{$serverId}/{$appName}/borg-repo";
+    }
+
+    private function borgEnv(array $ssh): array
+    {
+        $sshParts = [
+            'ssh',
+            '-p', (string) $ssh['port'],
+            '-o', 'StrictHostKeyChecking=accept-new',
+            '-o', 'ConnectTimeout=' . $this->config['rsync']['ssh_timeout'],
+        ];
+
+        if ($ssh['ssh_key'] !== null) {
+            array_splice($sshParts, 1, 0, ['-i', $ssh['ssh_key']]);
+            array_push($sshParts, '-o', 'BatchMode=yes');
+        } else {
+            array_push($sshParts, '-o', 'BatchMode=no');
+        }
+
+        $sshCmd = implode(' ', $sshParts);
+
+        if ($ssh['ssh_key'] === null && $ssh['password'] !== null) {
+            $sshCmd = 'sshpass -p ' . escapeshellarg($ssh['password']) . ' ' . $sshCmd;
+        }
+
+        return [
+            'BORG_RSH'        => $sshCmd,
+            'BORG_PASSPHRASE' => '',
+        ];
+    }
+
+    // ── SSH / rsync helpers ───────────────────────────────────────────────────
 
     private function sshFromDisk(array $diskConfig): array
     {

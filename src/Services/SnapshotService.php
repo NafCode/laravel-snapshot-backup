@@ -17,9 +17,14 @@ class SnapshotService
     }
 
     /**
-     * Run rsync file snapshot to ALL configured SFTP disks.
-     * Non-SFTP disks are skipped with a warning (rsync requires SSH).
-     * Fails if no SFTP disk succeeds.
+     * Run file snapshot to ALL configured SFTP disks.
+     *
+     * Per-disk backend selection via filesystems.php disk config:
+     *   'snapshot_backend' => 'borg'   → Borg Backup (deduplication, recommended for Hetzner)
+     *   'snapshot_backend' => 'rsync'  → plain rsync, no deduplication (default)
+     *
+     * Disk sources (S3, GCS, etc.) are always backed up via Flysystem stream-copy
+     * into snapshots/disk-sources/{diskname}/{slot}/ — independent of the file backend.
      */
     public function runFileBackup(?string $serverId = null, ?string $appName = null): BackupSnapshot
     {
@@ -41,6 +46,7 @@ class SnapshotService
 
         $succeeded = [];
         $failed    = [];
+        $sizeBytes = null;
 
         try {
             foreach ($this->config['disks'] as $diskName) {
@@ -53,9 +59,22 @@ class SnapshotService
                     continue;
                 }
 
+                $backend = $diskConfig['snapshot_backend'] ?? 'rsync';
+
                 try {
-                    $ssh         = $this->sshFromDiskConfig($diskName, $diskConfig);
-                    $sizeBytes   = $this->runSnapshotOnDisk($ssh, $diskName, $serverId, $appName, $currSlot);
+                    $ssh = $this->sshFromDiskConfig($diskName, $diskConfig);
+
+                    if ($backend === 'borg') {
+                        $sizeBytes = $this->runBorgBackup($ssh, $diskName, $serverId, $appName, $currSlot);
+                    } else {
+                        $sizeBytes = $this->runRsyncSnapshot($ssh, $diskName, $serverId, $appName, $currSlot);
+                    }
+
+                    // Disk sources (S3, GCS, etc.) — always via Flysystem, separate from file backend.
+                    foreach ($this->config['source']['files']['disks'] ?? [] as $sourceDiskName) {
+                        $this->backupDiskSource($sourceDiskName, $diskName, $ssh, $serverId, $appName, $currSlot);
+                    }
+
                     $succeeded[] = $diskName;
                 } catch (\Throwable $e) {
                     $failed[] = "{$diskName}: " . $e->getMessage();
@@ -79,7 +98,7 @@ class SnapshotService
 
             $record->update([
                 'status'           => 'success',
-                'size_bytes'       => $sizeBytes ?? null,
+                'size_bytes'       => $sizeBytes,
                 'duration_seconds' => now()->diffInSeconds($startedAt),
                 'rsync_stats'      => 'disks:' . implode(',', $succeeded),
             ]);
@@ -103,42 +122,127 @@ class SnapshotService
         return $record->fresh();
     }
 
-    private function runSnapshotOnDisk(
+    // ── Borg backend ──────────────────────────────────────────────────────────
+
+    private function runBorgBackup(
         array $ssh,
         string $diskName,
         string $serverId,
         string $appName,
         string $currSlot,
     ): ?int {
-        $remoteBase    = ($ssh['root'] !== '' ? $ssh['root'] . '/' : '') . $serverId . '/' . $appName;
-        $fileSlotsBase = $remoteBase . '/snapshots/files';
-        $snapCurr      = $fileSlotsBase . '/' . $currSlot;
+        $repoUrl = $this->borgRepoUrl($ssh, $serverId, $appName);
+        $borgEnv = $this->borgEnv($ssh);
 
-        // SFTP paths (Flysystem prepends disk root internally).
-        $sftpBase          = $serverId . '/' . $appName;
-        $sftpFileSlotsBase = $sftpBase . '/snapshots/files';
-        $sftpSnapCurr      = $sftpFileSlotsBase . '/' . $currSlot;
+        $this->borgInitIfNeeded($repoUrl, $borgEnv);
 
-        // Ensure destination slot directory exists (mkdir -p tolerates re-runs).
-        // --mkpath was dropped; it requires rsync ≥ 3.2.3 which is not available everywhere.
-        $this->remoteExec($ssh, "mkdir -p {$snapCurr}", false);
-        // Unlock in case the slot already exists from a same-slot re-run (non-fatal).
-        $this->remoteExec($ssh, "chmod -R u+w {$snapCurr}", false);
+        $includes = $this->config['source']['files']['include'];
+        $excludes = $this->config['source']['files']['exclude'];
 
-        // Find the most recent slot before this one → --link-dest source.
-        $prevSlot = collect(MediaService::disk($diskName)->directories($sftpFileSlotsBase))
-            ->map(fn ($d) => basename($d))
-            ->filter(fn ($d) => preg_match('/^\d{4}-\d{2}-\d{2}_\d{6}$/', $d) && $d < $currSlot)
-            ->sort()
-            ->last();
+        $cmd = ['borg', 'create', '--stats', '--compression', 'lz4'];
 
-        $linkDestArg = $prevSlot ? "../{$prevSlot}/" : null;
-
-        if ($prevSlot) {
-            Log::channel('backup')->info("disk:{$diskName} --link-dest from: {$prevSlot}");
-        } else {
-            Log::channel('backup')->warning("disk:{$diskName} no previous file slot — full backup.");
+        foreach ($excludes as $pattern) {
+            array_push($cmd, '--exclude', $pattern);
         }
+
+        $cmd[] = "{$repoUrl}::{$currSlot}";
+
+        foreach ($includes as $path) {
+            $cmd[] = rtrim($path, '/');
+        }
+
+        $process = new Process($cmd, null, $borgEnv, null, $this->config['queue']['timeout']);
+        $process->run();
+
+        $exitCode = $process->getExitCode();
+        if ($exitCode === 1) {
+            Log::channel('backup')->warning(
+                "borg create warnings disk:{$diskName}: " . trim($process->getErrorOutput())
+            );
+        } elseif ($exitCode !== 0) {
+            throw new \RuntimeException('borg create failed: ' . trim($process->getErrorOutput()));
+        }
+
+        Log::channel('backup')->info(
+            "borg create SUCCESS disk:{$diskName} {$serverId}/{$appName}::{$currSlot}\n"
+            . $process->getOutput()
+        );
+
+        $dbBase = './' . $serverId . '/' . $appName . '/snapshots/db';
+        $this->remoteExec($ssh, "mkdir -p {$dbBase}", false);
+
+        return null;
+    }
+
+    private function borgInitIfNeeded(string $repoUrl, array $borgEnv): void
+    {
+        $info = new Process(['borg', 'info', $repoUrl], null, $borgEnv, null, 30);
+        $info->run();
+
+        if ($info->isSuccessful()) {
+            return;
+        }
+
+        Log::channel('backup')->info("Initializing new Borg repo: {$repoUrl}");
+
+        $init = new Process(['borg', 'init', '--encryption=none', $repoUrl], null, $borgEnv, null, 60);
+        $init->run();
+
+        if (!$init->isSuccessful()) {
+            throw new \RuntimeException('borg init failed: ' . trim($init->getErrorOutput()));
+        }
+
+        Log::channel('backup')->info("Borg repo initialized.");
+    }
+
+    private function borgRepoUrl(array $ssh, string $serverId, string $appName): string
+    {
+        return "ssh://{$ssh['user']}@{$ssh['host']}:{$ssh['port']}/./{$serverId}/{$appName}/borg-repo";
+    }
+
+    private function borgEnv(array $ssh): array
+    {
+        $sshParts = [
+            'ssh',
+            '-p', (string) $ssh['port'],
+            '-o', 'StrictHostKeyChecking=accept-new',
+            '-o', 'ConnectTimeout=' . $this->config['rsync']['ssh_timeout'],
+        ];
+
+        if ($ssh['ssh_key'] !== null) {
+            array_splice($sshParts, 1, 0, ['-i', $ssh['ssh_key']]);
+            array_push($sshParts, '-o', 'BatchMode=yes');
+        } else {
+            array_push($sshParts, '-o', 'BatchMode=no');
+        }
+
+        $sshCmd = implode(' ', $sshParts);
+
+        if ($ssh['ssh_key'] === null && $ssh['password'] !== null) {
+            $sshCmd = 'sshpass -p ' . escapeshellarg($ssh['password']) . ' ' . $sshCmd;
+        }
+
+        return [
+            'BORG_RSH'        => $sshCmd,
+            'BORG_PASSPHRASE' => '',
+        ];
+    }
+
+    // ── rsync backend ─────────────────────────────────────────────────────────
+
+    private function runRsyncSnapshot(
+        array $ssh,
+        string $diskName,
+        string $serverId,
+        string $appName,
+        string $currSlot,
+    ): ?int {
+        $remoteBase   = ($ssh['root'] !== '' ? $ssh['root'] . '/' : '') . $serverId . '/' . $appName;
+        $snapCurr     = $remoteBase . '/snapshots/files/' . $currSlot;
+        $sftpSnapCurr = $serverId . '/' . $appName . '/snapshots/files/' . $currSlot;
+
+        $this->remoteExec($ssh, "mkdir -p {$snapCurr}", false);
+        $this->remoteExec($ssh, "chmod -R u+w {$snapCurr}", false);
 
         $includes = $this->config['source']['files']['include'];
         $excludes = $this->config['source']['files']['exclude'];
@@ -149,31 +253,18 @@ class SnapshotService
                     srcPath:  rtrim($includePath, '/'),
                     ssh:      $ssh,
                     destPath: $snapCurr . '/',
-                    linkDest: $linkDestArg,
                     excludes: $excludes,
                 );
-                $this->runWithRetry($rsyncCmd, $this->config['rsync']['retry_count'], $this->config['rsync']['retry_delay']);
-            }
-
-            // Disk sources (S3, GCS, etc.) — stream-copied via Flysystem.
-            // Each disk lands in SLOT/{diskname}/ on the backup disk.
-            foreach ($this->config['source']['files']['disks'] ?? [] as $sourceDiskName) {
-                $this->backupDiskSource(
-                    sourceDiskName: $sourceDiskName,
-                    backupDiskName: $diskName,
-                    ssh:            $ssh,
-                    remoteSnapCurr: $snapCurr,
-                    sftpSnapCurr:   $sftpSnapCurr,
+                $this->runWithRetry(
+                    $rsyncCmd,
+                    $this->config['rsync']['retry_count'],
+                    $this->config['rsync']['retry_delay']
                 );
             }
 
-            // Update latest symlink (non-fatal — restricted shells may ignore ln).
             $this->remoteExec($ssh, "ln -sfn snapshots/files/{$currSlot} {$remoteBase}/latest", false);
-            // Lock slot read-only (non-fatal).
             $this->remoteExec($ssh, "chmod -R a-w {$snapCurr}", false);
-            // Bootstrap the DB backup directory via SSH (reliable on Hetzner restricted shell).
             $this->remoteExec($ssh, "mkdir -p {$remoteBase}/snapshots/db", false);
-
         } catch (\Throwable $e) {
             try { MediaService::disk($diskName)->deleteDirectory($sftpSnapCurr); } catch (\Throwable) {}
             throw $e;
@@ -182,7 +273,58 @@ class SnapshotService
         return $this->parseSnapshotSize($ssh, $snapCurr);
     }
 
-    // ── SSH / rsync Helpers ───────────────────────────────────────────────────
+    // ── Disk source backup (backend-agnostic, always Flysystem) ──────────────
+
+    private function backupDiskSource(
+        string $sourceDiskName,
+        string $backupDiskName,
+        array $ssh,
+        string $serverId,
+        string $appName,
+        string $currSlot,
+    ): void {
+        $sftpDestBase  = "{$serverId}/{$appName}/snapshots/disk-sources/{$sourceDiskName}/{$currSlot}";
+        $remoteDestDir = ($ssh['root'] !== '' ? $ssh['root'] . '/' : '') . $sftpDestBase;
+
+        $sourceDisk = MediaService::disk($sourceDiskName);
+        $backupDisk = MediaService::disk($backupDiskName);
+
+        $this->remoteExec($ssh, "mkdir -p {$remoteDestDir}", false);
+
+        $files  = $sourceDisk->allFiles();
+        $copied = 0;
+        $errors = 0;
+
+        foreach ($files as $file) {
+            try {
+                $stream = $sourceDisk->readStream($file);
+                if (!is_resource($stream)) {
+                    continue;
+                }
+                $backupDisk->writeStream("{$sftpDestBase}/{$file}", $stream);
+                fclose($stream);
+                $copied++;
+            } catch (\Throwable $e) {
+                $errors++;
+                Log::channel('backup')->warning(
+                    "disk-source: failed to copy '{$file}' from {$sourceDiskName}: " . $e->getMessage()
+                );
+            }
+        }
+
+        Log::channel('backup')->info(
+            "disk-source: {$sourceDiskName} → {$backupDiskName} slot:{$currSlot}"
+            . " copied={$copied} errors={$errors}"
+        );
+
+        if ($errors > 0 && $copied === 0) {
+            throw new \RuntimeException(
+                "disk-source backup failed: no files copied from {$sourceDiskName} ({$errors} errors)"
+            );
+        }
+    }
+
+    // ── SSH / rsync helpers ───────────────────────────────────────────────────
 
     private function sshFromDiskConfig(string $diskName, array $diskConfig): array
     {
@@ -220,7 +362,6 @@ class SnapshotService
         string $srcPath,
         array $ssh,
         string $destPath,
-        ?string $linkDest,
         array $excludes,
     ): array {
         $sshCmd = $this->buildSshInlineCmd($ssh);
@@ -241,10 +382,6 @@ class SnapshotService
             '--stats',
             '-e', $sshCmd,
         );
-
-        if ($linkDest !== null) {
-            $cmd[] = '--link-dest=' . $linkDest;
-        }
 
         foreach ($excludes as $pattern) {
             $cmd[] = '--exclude=' . $pattern;
@@ -285,7 +422,6 @@ class SnapshotService
 
             $exitCode = $process->getExitCode();
 
-            // 0 = success, 24 = vanished source files (acceptable)
             if ($exitCode === 0 || $exitCode === 24) {
                 Log::channel('backup')->info("rsync completed.\n" . $this->extractStats($process->getOutput()));
                 return;
@@ -326,66 +462,11 @@ class SnapshotService
         return $process->getOutput();
     }
 
-    /**
-     * Stream-copy all files from a Laravel filesystem disk (e.g. S3) into
-     * SLOT/{sourceDiskName}/ on the backup disk.
-     *
-     * No --link-dest deduplication — each slot is a full copy of the source disk.
-     * SSH mkdir -p is called first to ensure the base dir exists on Hetzner before
-     * Flysystem writes (avoids the silent-fail on freshly created SFTP paths).
-     */
-    private function backupDiskSource(
-        string $sourceDiskName,
-        string $backupDiskName,
-        array $ssh,
-        string $remoteSnapCurr,  // SSH path used for mkdir
-        string $sftpSnapCurr,    // Flysystem path (disk root prepended internally)
-    ): void {
-        $sourceDisk   = MediaService::disk($sourceDiskName);
-        $backupDisk   = MediaService::disk($backupDiskName);
-        $sftpDestBase = $sftpSnapCurr . '/' . $sourceDiskName;
-
-        // Ensure the base destination dir exists via SSH before any Flysystem write.
-        $this->remoteExec($ssh, "mkdir -p {$remoteSnapCurr}/{$sourceDiskName}", false);
-
-        $files  = $sourceDisk->allFiles();
-        $copied = 0;
-        $errors = 0;
-
-        foreach ($files as $file) {
-            try {
-                $stream = $sourceDisk->readStream($file);
-                if (!is_resource($stream)) {
-                    continue;
-                }
-                $backupDisk->writeStream("{$sftpDestBase}/{$file}", $stream);
-                fclose($stream);
-                $copied++;
-            } catch (\Throwable $e) {
-                $errors++;
-                Log::channel('backup')->warning(
-                    "disk-source backup: failed to copy '{$file}' from {$sourceDiskName}: " . $e->getMessage()
-                );
-            }
-        }
-
-        Log::channel('backup')->info(
-            "disk-source backup: {$sourceDiskName} → {$backupDiskName}/{$sourceDiskName}"
-            . " copied={$copied} errors={$errors}"
-        );
-
-        if ($errors > 0 && $copied === 0) {
-            throw new \RuntimeException(
-                "disk-source backup failed: no files copied from {$sourceDiskName} ({$errors} errors)"
-            );
-        }
-    }
-
     private function parseSnapshotSize(array $ssh, string $remotePath): ?int
     {
         try {
-            $out = $this->remoteExec($ssh, "du -sb {$remotePath}", false);
-            return (int) trim(explode("\t", $out)[0]) ?: null;
+            $out = $this->remoteExec($ssh, "du -sb {$remotePath} 2>/dev/null | awk '{print $1}'", false);
+            return (int) trim($out) ?: null;
         } catch (\Throwable) {
             return null;
         }

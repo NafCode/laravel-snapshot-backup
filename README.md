@@ -1,13 +1,13 @@
 # Laravel Snapshot Backup
 
-rsync-based snapshot backup for Laravel applications. Backs up files and databases to remote storage (Hetzner Storage Box, or any SFTP server) with hard-link deduplication, hourly DB dumps, multi-disk mirroring, cloud disk (S3) backup support, and full restore via Artisan commands.
+Snapshot backup for Laravel applications. Backs up files and databases to remote storage (Hetzner Storage Box, or any SFTP server) with **Borg Backup deduplication** or rsync, hourly DB dumps, multi-disk mirroring, cloud disk (S3) backup support, and full restore via Artisan commands.
 
 ---
 
 ## Features
 
-- **File snapshots** via rsync with `--link-dest` hard-linking — unchanged files are not re-transferred or re-stored; only deltas consume new space
-- **Cloud disk backup** — S3, GCS, or any Laravel filesystem disk stream-copied into each snapshot slot alongside local paths
+- **File snapshots** via **Borg Backup** (content-addressable deduplication, recommended for Hetzner) or plain rsync — selected per backup disk via `snapshot_backend` in your disk config
+- **Cloud disk backup** — S3, GCS, or any Laravel filesystem disk stream-copied alongside file snapshots, stored separately from the Borg repo
 - **Database dumps** — mysqldump piped through gzip, uploaded via rsync (SFTP disks) or Flysystem (S3, local, etc.)
 - **Multi-disk mirroring** — write to multiple backup destinations on every run
 - **Retention cleanup** — configurable per-type retention window (default 30 days)
@@ -25,10 +25,13 @@ rsync-based snapshot backup for Laravel applications. Backs up files and databas
 | PHP | 8.2+ |
 | Laravel | 10+ or 11+ |
 | MySQL | 5.7+ (for mysqldump) |
-| rsync | Any version (no `--mkpath` — remote directories are created via SSH `mkdir -p` before each rsync run) |
+| rsync | Any version (used for non-Borg SFTP disks; remote dirs created via SSH `mkdir -p`) |
+| borgbackup | Any version on the **app server** (only when `snapshot_backend = 'borg'`) |
 | sshpass | Any (only required if using password-based SSH auth; not needed for SSH key auth) |
 | Redis | Any (recommended for the dedicated backup queue) |
 | spatie/laravel-medialibrary | ^10.0 or ^11.0 |
+
+> **borgbackup** is only needed on the app server when using the Borg backend. Install with `apt install borgbackup`. The Borg repo lives on the remote storage; the app server runs `borg create` over SSH.
 
 > **sshpass** is only needed if your storage disk uses password authentication. Install with `apt install sshpass`. SSH key auth is recommended for production — no extra package, no password in process arguments.
 
@@ -104,9 +107,37 @@ If your application already uses `FILESYSTEM_CLOUD_STATUS` to switch between loc
 'disks'   => config('filesystems.cloud_status') ? ['s3'] : [],
 ```
 
+### Backend selection: Borg vs rsync
+
+Add `snapshot_backend` to each backup disk in `config/filesystems.php`:
+
+```php
+'hetzner' => [
+    'driver'   => 'sftp',
+    // ...
+    'snapshot_backend' => 'borg',   // Borg deduplication (recommended for Hetzner)
+    // 'snapshot_backend' => 'rsync',  // Plain rsync, no deduplication (default)
+],
+```
+
+**When to use Borg:**
+- Hetzner Storage Box — hard links (`ln`) are unavailable on its restricted shell, so rsync `--link-dest` silently makes full copies instead of deduplicated snapshots. Borg uses content-addressable chunking that does not need hard links.
+- Any storage where disk quota matters.
+
+**When to use rsync (default):**
+- Other SFTP servers where Borg is not available or not needed.
+- Keeping things simple for low-volume backups.
+
+**Storage comparison (example: 3.8 GB assets, 185 MB DB, 30-day retention):**
+
+| Backend | File storage | DB storage | Total |
+|---------|-------------|------------|-------|
+| rsync (full copy each run) | ~384 GB | ~133 GB | ~517 GB |
+| Borg (deduplicated) | ~8–15 GB | ~133 GB | ~141–148 GB |
+
 ### Storage disk (filesystems.php)
 
-Backup storage requires an **SFTP disk** for file snapshots (rsync needs SSH). Database dumps also work with S3, local, or any Flysystem driver.
+Backup storage requires an **SFTP disk** for file snapshots (rsync/Borg both need SSH). Database dumps also work with S3, local, or any Flysystem driver.
 
 Example Hetzner Storage Box disk:
 
@@ -266,32 +297,55 @@ php artisan snapshot-backup:cleanup --sync
 
 ### Remote directory structure
 
+**Borg backend:**
+```
+{server_id}/{app_name}/
+├── borg-repo/                        ← Borg repository (managed by borg, not SFTP)
+├── snapshots/
+│   ├── db/
+│   │   ├── 2026-04-06/
+│   │   │   ├── db-App-2026-04-06_000000.sql.gz
+│   │   │   └── ...  (one per hour)
+│   │   └── ...  (30 days retained)
+│   └── disk-sources/                 ← S3/cloud disk backups (if configured)
+│       └── s3/
+│           ├── 2026-04-06_060000/    ← one slot per backup run
+│           └── ...
+```
+
+**rsync backend:**
 ```
 {server_id}/{app_name}/
 ├── latest -> snapshots/files/2026-04-06_060000   (symlink)
 └── snapshots/
     ├── files/
     │   ├── 2026-04-06_060000/        ← one slot per backup run
-    │   │   ├── public/               ← local path (named after source dir)
-    │   │   └── s3/                   ← disk source (named after disk)
-    │   ├── 2026-04-06_000000/        ← local paths ~95% hard-linked to prev slot
+    │   │   └── public/               ← local path (named after source dir)
     │   └── ...  (30 days retained)
-    └── db/
-        ├── 2026-04-06/
-        │   ├── db-App-2026-04-06_000000.sql.gz
-        │   ├── db-App-2026-04-06_010000.sql.gz
-        │   └── ...  (one per hour)
-        └── ...  (30 days retained)
+    ├── db/
+    │   ├── 2026-04-06/
+    │   │   └── ...  (one per hour)
+    │   └── ...
+    └── disk-sources/                 ← S3/cloud disk backups (if configured)
+        └── s3/
+            └── 2026-04-06_060000/
 ```
 
-### File backup
+### File backup (Borg)
 
-1. Finds the most recent previous slot on the remote via SFTP directory listing
-2. Creates the destination slot directory on the remote via SSH `mkdir -p`
-3. Runs rsync with `--link-dest=../PREV_SLOT/` — unchanged files are hard-linked, not re-transferred
-4. Stream-copies any configured `source.files.disks` (S3, etc.) into `SLOT/{diskname}/` via Flysystem
-5. Applies read-only lock (`chmod -R a-w`) after success
-6. Retries up to 3× on failure (rsync exit code 24 — vanished source files — is treated as success)
+1. Checks if the Borg repo exists (`borg info`); initialises it (`borg init --encryption=none`) on first run
+2. Runs `borg create --compression lz4` — stores only changed chunks, deduplicated across all archives
+3. Exit code 1 = warnings only (e.g. file changed while reading) — treated as success
+4. Bootstraps the DB snapshot directory via SSH `mkdir -p`
+5. Stream-copies any configured `source.files.disks` (S3, etc.) into `disk-sources/{diskname}/{slot}/` via Flysystem
+
+### File backup (rsync)
+
+1. Creates the destination slot directory on the remote via SSH `mkdir -p`
+2. Runs rsync (no `--link-dest` — hard links are unreliable on many SFTP servers)
+3. Stream-copies any configured `source.files.disks` (S3, etc.) into `disk-sources/{diskname}/{slot}/`
+4. Applies read-only lock (`chmod -R a-w`) after success
+5. Retries up to 3× on failure (exit code 24 — vanished source files — is treated as success)
 
 ### Database backup
 
@@ -390,13 +444,16 @@ HETZNER_PASSWORD=...
 
 - [ ] `SNAPSHOT_BACKUP_ENABLED=true` in `.env`
 - [ ] Storage disk configured in `config/filesystems.php`
+- [ ] Add `'snapshot_backend' => 'borg'` to disk config if using Hetzner Storage Box (or any storage where deduplication matters)
 - [ ] `disks` array in `config/snapshot-backup.php` points to that disk
 - [ ] If backing up S3 uploads: add disk name to `source.files.disks`
 - [ ] `backup` queue connection added to `config/queue.php`
 - [ ] `backup-supervisor` added to `config/horizon.php` (or equivalent queue worker)
 - [ ] `backup` log channel added to `config/logging.php`
+- [ ] `borgbackup` installed on app server if using Borg (`apt install borgbackup`)
 - [ ] `sshpass` installed if using password auth (`apt install sshpass`)
 - [ ] Smoke test: `php artisan snapshot-backup:run --sync --db-only`
+- [ ] Smoke test files: `php artisan snapshot-backup:run --sync --files-only`
 - [ ] Verify: `php artisan snapshot-backup:list`
 
 ---
