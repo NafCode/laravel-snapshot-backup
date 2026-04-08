@@ -10,7 +10,7 @@ Snapshot backup for Laravel applications. Backs up files and databases to remote
 - **Cloud disk backup** — S3, GCS, or any Laravel filesystem disk stream-copied alongside file snapshots, stored separately from the Borg repo
 - **Database dumps** — mysqldump piped through gzip, uploaded via rsync (SFTP disks) or Flysystem (S3, local, etc.)
 - **Multi-disk mirroring** — write to multiple backup destinations on every run
-- **Retention cleanup** — configurable per-type retention window (default 30 days)
+- **Retention cleanup** — configurable per-type retention (files/DB: days-based; disk sources: slot-count)
 - **Full restore** — files via rsync, database via `zcat | mysql`, with pre-restore failsafe dump
 - **Queue isolation** — backup jobs run on a dedicated queue, never blocking app workers
 - **Failure alerts** — synchronous email notifications when jobs exhaust all retries
@@ -98,7 +98,7 @@ By default the package backs up local filesystem paths via rsync. If your upload
 ],
 ```
 
-You can mix both: local paths go via rsync (with deduplication), disk sources go via Flysystem stream copy (full copy each run, no deduplication). Each disk's files land in `SLOT/{diskname}/` inside the snapshot slot.
+You can mix both: local paths go via rsync (with deduplication), disk sources go via Flysystem stream copy (full copy each run, no deduplication). Each disk's files land in `disk-sources/{diskname}/{slot}/`. Disk-source retention is slot-count based (`keep_disk_source_slots`, default 2) — only the N most recent copies are kept.
 
 If your application already uses `FILESYSTEM_CLOUD_STATUS` to switch between local and S3, you can make the backup source auto-detect:
 
@@ -473,6 +473,7 @@ HETZNER_PASSWORD=...
 | Uploaded files | ~6 hours (every 6 hours) |
 | Database records | ~1 hour (every hour) |
 | Data older than 30 days | Permanent — not recoverable |
+| S3/disk-source data beyond 2 latest copies | Permanent — only 2 slots kept (configurable via `keep_disk_source_slots`) |
 
 ---
 

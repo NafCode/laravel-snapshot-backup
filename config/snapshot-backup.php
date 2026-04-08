@@ -100,10 +100,23 @@ return [
     |--------------------------------------------------------------------------
     | How long to keep snapshots. Files and DB are retained independently.
     | Cleanup runs automatically via the snapshot-backup:cleanup command.
+    |
+    | keep_file_days — delete file snapshot slots (Borg archives / rsync
+    |   dirs) older than N days.
+    |
+    | keep_db_days — delete DB date-directories older than N days.
+    |   Each date-dir accumulates one dump per run (e.g. 24 dumps/day if DB
+    |   runs hourly). Deleting the dir removes all dumps for that day.
+    |
+    | keep_disk_source_slots — keep only the N most recent disk-source
+    |   backups (S3, FTP, etc.). These are full stream-copies with no
+    |   deduplication, so storage grows linearly. Local file backups
+    |   (Borg/rsync) are unaffected — they follow keep_file_days.
     */
     'retention' => [
-        'keep_file_days' => 30,
-        'keep_db_days'   => 30,
+        'keep_file_days'         => 30,
+        'keep_db_days'           => 30,
+        'keep_disk_source_slots' => 2,
     ],
 
     /*

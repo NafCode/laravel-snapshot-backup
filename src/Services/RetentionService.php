@@ -265,8 +265,7 @@ class RetentionService
 
     private function cleanupDiskSources(string $diskName, string $serverId, string $appName): void
     {
-        $keepDays        = $this->config['retention']['keep_file_days'];
-        $cutoff          = now()->subDays($keepDays)->format('Y-m-d_H0000');
+        $keepSlots       = (int) ($this->config['retention']['keep_disk_source_slots'] ?? 2);
         $disk            = MediaService::disk($diskName);
         $diskSourcesBase = "{$serverId}/{$appName}/snapshots/disk-sources";
 
@@ -281,9 +280,17 @@ class RetentionService
             $slotBase      = "{$diskSourcesBase}/{$sourceDirName}";
 
             try {
-                $toDelete = collect($disk->directories($slotBase))
+                $slots = collect($disk->directories($slotBase))
                     ->map(fn ($d) => basename($d))
-                    ->filter(fn ($d) => preg_match('/^\d{4}-\d{2}-\d{2}_\d{6}$/', $d) && $d < $cutoff);
+                    ->filter(fn ($d) => preg_match('/^\d{4}-\d{2}-\d{2}_\d{6}$/', $d))
+                    ->sort()
+                    ->values();
+
+                if ($slots->count() <= $keepSlots) {
+                    continue;
+                }
+
+                $toDelete = $slots->slice(0, $slots->count() - $keepSlots);
 
                 foreach ($toDelete as $slot) {
                     try {

@@ -131,6 +131,18 @@ class SnapshotService
         string $appName,
         string $currSlot,
     ): ?int {
+        $includes = $this->config['source']['files']['include'];
+        $excludes = $this->config['source']['files']['exclude'];
+
+        if (empty($includes)) {
+            // No local paths configured (e.g. cloud storage mode — uploads go to S3).
+            // Skip borg entirely; disk-sources backup still runs in the caller.
+            Log::channel('backup')->info(
+                "borg create skipped disk:{$diskName} {$serverId}/{$appName} — no local paths configured."
+            );
+            return null;
+        }
+
         $repoUrl = $this->borgRepoUrl($ssh, $serverId, $appName);
         $borgEnv = $this->borgEnv($ssh);
 
@@ -139,9 +151,6 @@ class SnapshotService
         $this->remoteExec($ssh, 'mkdir -p ./' . $serverId . '/' . $appName, false);
 
         $this->borgInitIfNeeded($repoUrl, $borgEnv);
-
-        $includes = $this->config['source']['files']['include'];
-        $excludes = $this->config['source']['files']['exclude'];
 
         $cmd = ['borg', 'create', '--stats', '--compression', 'lz4'];
 
