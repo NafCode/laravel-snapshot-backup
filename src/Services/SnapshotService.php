@@ -202,7 +202,16 @@ class SnapshotService
         $init->run();
 
         if (!$init->isSuccessful()) {
-            throw new \RuntimeException('borg init failed: ' . trim($init->getErrorOutput()));
+            $stderr = trim($init->getErrorOutput());
+
+            // "already exists" means borg info failed for a transient reason
+            // (timeout, lock, etc.) but the repo is actually there — safe to continue.
+            if (str_contains($stderr, 'already exists')) {
+                Log::channel('backup')->info("Borg repo already exists (borg info had failed): {$repoUrl}");
+                return;
+            }
+
+            throw new \RuntimeException('borg init failed: ' . $stderr);
         }
 
         Log::channel('backup')->info("Borg repo initialized.");
