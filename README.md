@@ -464,6 +464,12 @@ HETZNER_PASSWORD=...
 - [ ] Smoke test files: `php artisan snapshot-backup:run --sync --files-only`
 - [ ] Verify: `php artisan snapshot-backup:list`
 
+> **S3 disk sources — first run:** The first backup copies every file from S3 to the backup
+> disk via stream (S3 → app server → SFTP). For large buckets (thousands of files) this can
+> take several hours. **Always run the first backup with `--sync`** to avoid queue timeouts.
+> Subsequent runs are incremental — unchanged files (same size) are carried forward via
+> server-side SFTP copy, reducing runtime to ~15–20 minutes for typical workloads.
+
 ---
 
 ## Data Loss Windows (Default Schedule)
