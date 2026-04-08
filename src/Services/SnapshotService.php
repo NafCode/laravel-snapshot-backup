@@ -312,21 +312,58 @@ class SnapshotService
         $sourceDisk = MediaService::disk($sourceDiskName);
         $backupDisk = MediaService::disk($backupDiskName);
 
+        // Ensure the destination directory exists via SSH before any Flysystem write.
         $this->remoteExec($ssh, "mkdir -p {$remoteDestDir}", false);
 
-        $files  = $sourceDisk->allFiles();
-        $copied = 0;
-        $errors = 0;
+        // Build an index of existing files in the previous slot (if any) for
+        // incremental backup — skip files that haven't changed (same size).
+        $prevSlotFiles = $this->getPreviousSlotIndex($backupDisk, $serverId, $appName, $sourceDiskName, $currSlot);
+
+        $files   = $sourceDisk->allFiles();
+        $total   = count($files);
+        $copied  = 0;
+        $skipped = 0;
+        $errors  = 0;
+
+        Log::channel('backup')->info(
+            "disk-source: starting {$sourceDiskName} → {$backupDiskName} slot:{$currSlot}"
+            . " ({$total} files, " . count($prevSlotFiles) . " in previous slot)"
+        );
 
         foreach ($files as $file) {
             try {
+                // Skip if the file exists in the previous slot with the same size.
+                if (isset($prevSlotFiles[$file])) {
+                    $sourceSize = $sourceDisk->size($file);
+                    if ($sourceSize === $prevSlotFiles[$file]) {
+                        // Copy from previous slot on the same SFTP disk (server-side, no download).
+                        $backupDisk->copy($prevSlotFiles['__prefix__'] . '/' . $file, "{$sftpDestBase}/{$file}");
+                        $skipped++;
+
+                        if ($skipped % 500 === 0) {
+                            Log::channel('backup')->info(
+                                "disk-source: {$sourceDiskName} carried forward: {$skipped}"
+                            );
+                        }
+                        continue;
+                    }
+                }
+
                 $stream = $sourceDisk->readStream($file);
                 if (!is_resource($stream)) {
                     continue;
                 }
                 $backupDisk->writeStream("{$sftpDestBase}/{$file}", $stream);
-                fclose($stream);
+                if (is_resource($stream)) {
+                    fclose($stream);
+                }
                 $copied++;
+
+                if ($copied % 100 === 0) {
+                    Log::channel('backup')->info(
+                        "disk-source: {$sourceDiskName} progress: {$copied} copied, {$skipped} carried forward / {$total}"
+                    );
+                }
             } catch (\Throwable $e) {
                 $errors++;
                 Log::channel('backup')->warning(
@@ -337,13 +374,63 @@ class SnapshotService
 
         Log::channel('backup')->info(
             "disk-source: {$sourceDiskName} → {$backupDiskName} slot:{$currSlot}"
-            . " copied={$copied} errors={$errors}"
+            . " done: {$copied} copied, {$skipped} carried forward, {$errors} errors (total {$total})"
         );
 
-        if ($errors > 0 && $copied === 0) {
+        if ($errors > 0 && $copied === 0 && $skipped === 0) {
             throw new \RuntimeException(
                 "disk-source backup failed: no files copied from {$sourceDiskName} ({$errors} errors)"
             );
+        }
+    }
+
+    /**
+     * Build a [relativePath => fileSize] index from the most recent previous slot
+     * on the backup disk. Returns empty array if no previous slot exists.
+     * The special key '__prefix__' holds the SFTP path prefix for server-side copy.
+     */
+    private function getPreviousSlotIndex(
+        $backupDisk,
+        string $serverId,
+        string $appName,
+        string $sourceDiskName,
+        string $currSlot,
+    ): array {
+        $diskSourcesBase = "{$serverId}/{$appName}/snapshots/disk-sources/{$sourceDiskName}";
+
+        try {
+            $slots = collect($backupDisk->directories($diskSourcesBase))
+                ->map(fn ($d) => basename($d))
+                ->filter(fn ($d) => preg_match('/^\d{4}-\d{2}-\d{2}_\d{6}$/', $d) && $d < $currSlot)
+                ->sort()
+                ->values();
+
+            if ($slots->isEmpty()) {
+                return [];
+            }
+
+            $prevSlot  = $slots->last();
+            $prevBase  = "{$diskSourcesBase}/{$prevSlot}";
+            $prevFiles = $backupDisk->allFiles($prevBase);
+            $prefixLen = strlen(rtrim($prevBase, '/')) + 1;
+
+            $index = ['__prefix__' => $prevBase];
+            foreach ($prevFiles as $filePath) {
+                $relative = substr($filePath, $prefixLen);
+                try {
+                    $index[$relative] = $backupDisk->size($filePath);
+                } catch (\Throwable) {
+                    // Can't stat — skip, will be re-copied from source.
+                }
+            }
+
+            Log::channel('backup')->info(
+                "disk-source: previous slot {$prevSlot} indexed with " . (count($index) - 1) . " files"
+            );
+
+            return $index;
+        } catch (\Throwable) {
+            return [];
         }
     }
 
