@@ -566,6 +566,7 @@ class SnapshotBackupRestoreCommand extends Command
         return [
             'BORG_RSH'        => $sshCmd,
             'BORG_PASSPHRASE' => '',
+            'BORG_BASE_DIR'   => storage_path('app/snapshot-backup/borg'),
         ];
     }
 
