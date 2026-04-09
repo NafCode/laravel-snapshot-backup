@@ -24,6 +24,18 @@ class RetentionService
         $serverId ??= $this->config['server_id'];
         $appName  ??= $this->config['app_name'];
 
+        $safeCleanup = $this->config['retention']['safe_cleanup'] ?? true;
+
+        // Safety check: refuse to delete backups if no recent healthy backup exists.
+        // This prevents silent data loss if the source (S3, local disk) was deleted.
+        if ($safeCleanup && !$this->hasRecentHealthyBackup($serverId, $appName)) {
+            Log::channel('backup')->warning(
+                "Retention SKIPPED: {$serverId}/{$appName} — no recent successful (non-empty) file backup found. "
+                . "Old backups preserved to prevent data loss. Investigate the backup source."
+            );
+            return;
+        }
+
         foreach ($this->config['disks'] as $diskName) {
             $diskConfig = config("filesystems.disks.{$diskName}");
             $backend    = $diskConfig['snapshot_backend'] ?? 'rsync';
@@ -37,6 +49,22 @@ class RetentionService
             $this->cleanupDbDays($diskName, $serverId, $appName);
             $this->cleanupDiskSources($diskName, $diskConfig, $serverId, $appName);
         }
+    }
+
+    /**
+     * Check if there is at least one successful (not empty/warning/failed)
+     * file backup within the retention window.
+     */
+    private function hasRecentHealthyBackup(string $serverId, string $appName): bool
+    {
+        $keepDays = $this->config['retention']['keep_file_days'];
+
+        return BackupSnapshot::query()
+            ->forApp($serverId, $appName)
+            ->where('type', 'files')
+            ->where('status', 'success')
+            ->where('snapshot_date', '>=', now()->subDays($keepDays)->format('Y-m-d'))
+            ->exists();
     }
 
     /**

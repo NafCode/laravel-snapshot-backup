@@ -112,11 +112,18 @@ return [
     |   backups (S3, FTP, etc.). These are full stream-copies with no
     |   deduplication, so storage grows linearly. Local file backups
     |   (Borg/rsync) are unaffected — they follow keep_file_days.
+    |
+    | safe_cleanup — if true (default), retention refuses to delete any
+    |   backups when no successful file backup exists within the retention
+    |   window. Prevents silent data loss if the source (S3 bucket, local
+    |   disk) is accidentally deleted — old good backups survive until a
+    |   healthy backup runs again.
     */
     'retention' => [
         'keep_file_days'         => 30,
         'keep_db_days'           => 30,
         'keep_disk_source_slots' => 2,
+        'safe_cleanup'           => true,
     ],
 
     /*

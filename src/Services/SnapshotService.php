@@ -3,6 +3,7 @@
 namespace SnapshotBackup\Services;
 
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Notification;
 use SnapshotBackup\Models\BackupSnapshot;
 use SnapshotBackup\Services\MediaService;
 use Symfony\Component\Process\Process;
@@ -44,9 +45,10 @@ class SnapshotService
             'status'        => 'running',
         ]);
 
-        $succeeded = [];
-        $failed    = [];
-        $sizeBytes = null;
+        $succeeded  = [];
+        $failed     = [];
+        $sizeBytes  = null;
+        $fileCount  = 0;
 
         try {
             foreach ($this->config['disks'] as $diskName) {
@@ -72,7 +74,16 @@ class SnapshotService
 
                     // Disk sources (S3, GCS, etc.) — always via Flysystem, separate from file backend.
                     foreach ($this->config['source']['files']['disks'] ?? [] as $sourceDiskName) {
-                        $this->backupDiskSource($sourceDiskName, $diskName, $ssh, $serverId, $appName, $currSlot);
+                        $fileCount += $this->backupDiskSource($sourceDiskName, $diskName, $ssh, $serverId, $appName, $currSlot);
+                    }
+
+                    // Count local include paths for borg/rsync file count.
+                    foreach ($this->config['source']['files']['include'] ?? [] as $path) {
+                        if (is_dir($path)) {
+                            $fileCount += iterator_count(
+                                new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($path, \FilesystemIterator::SKIP_DOTS))
+                            );
+                        }
                     }
 
                     $succeeded[] = $diskName;
@@ -96,16 +107,35 @@ class SnapshotService
                 throw new \RuntimeException('Some disks failed: ' . implode(' | ', $failed));
             }
 
+            // Detect anomalies by comparing against the last successful backup.
+            $status = $this->detectBackupAnomaly($serverId, $appName, $fileCount);
+
             $record->update([
-                'status'           => 'success',
+                'status'           => $status,
                 'size_bytes'       => $sizeBytes,
+                'file_count'       => $fileCount,
                 'duration_seconds' => now()->diffInSeconds($startedAt),
                 'rsync_stats'      => 'disks:' . implode(',', $succeeded),
             ]);
 
-            Log::channel('backup')->info(
-                "File backup SUCCESS: {$serverId}/{$appName} ({$currSlot}) disks=" . implode(',', $succeeded)
-            );
+            if ($status === 'empty') {
+                Log::channel('backup')->error(
+                    "File backup EMPTY: {$serverId}/{$appName} ({$currSlot}) — source has 0 files!"
+                );
+                $this->sendAnomalyAlert($serverId, $appName, $fileCount, 0);
+            } elseif ($status === 'warning') {
+                $prevCount = $this->getLastSuccessfulFileCount($serverId, $appName);
+                Log::channel('backup')->warning(
+                    "File backup WARNING: {$serverId}/{$appName} ({$currSlot})"
+                    . " — file count dropped from {$prevCount} to {$fileCount} (>50% decrease)"
+                );
+                $this->sendAnomalyAlert($serverId, $appName, $fileCount, $prevCount);
+            } else {
+                Log::channel('backup')->info(
+                    "File backup SUCCESS: {$serverId}/{$appName} ({$currSlot})"
+                    . " files={$fileCount} disks=" . implode(',', $succeeded)
+                );
+            }
 
         } catch (\Throwable $e) {
             $record->update([
@@ -120,6 +150,65 @@ class SnapshotService
         }
 
         return $record->fresh();
+    }
+
+    // ── Anomaly detection ─────────────────────────────────────────────────────
+
+    /**
+     * Compare current file count against the last successful backup.
+     * Returns 'empty', 'warning', or 'success'.
+     */
+    private function detectBackupAnomaly(string $serverId, string $appName, int $fileCount): string
+    {
+        if ($fileCount === 0) {
+            return 'empty';
+        }
+
+        $prevCount = $this->getLastSuccessfulFileCount($serverId, $appName);
+
+        // No previous backup to compare — first run is always success.
+        if ($prevCount === null || $prevCount === 0) {
+            return 'success';
+        }
+
+        // >50% drop is suspicious.
+        if ($fileCount < $prevCount * 0.5) {
+            return 'warning';
+        }
+
+        return 'success';
+    }
+
+    private function getLastSuccessfulFileCount(string $serverId, string $appName): ?int
+    {
+        return BackupSnapshot::query()
+            ->forApp($serverId, $appName)
+            ->where('type', 'files')
+            ->where('status', 'success')
+            ->whereNotNull('file_count')
+            ->latest('id')
+            ->value('file_count');
+    }
+
+    private function sendAnomalyAlert(string $serverId, string $appName, int $currentCount, ?int $previousCount): void
+    {
+        $emails = array_filter((array) config('snapshot-backup.notifications.mail'));
+
+        if (empty($emails)) {
+            return;
+        }
+
+        $message = $currentCount === 0
+            ? "Source has 0 files — bucket/folder may have been deleted."
+            : "File count dropped from {$previousCount} to {$currentCount} (>" . '50% decrease).';
+
+        Notification::route('mail', $emails)
+            ->notifyNow(new \SnapshotBackup\Notifications\SnapshotBackupFailed(
+                $serverId,
+                $appName,
+                'files',
+                new \RuntimeException("Backup anomaly: {$message}")
+            ));
     }
 
     // ── Borg backend ──────────────────────────────────────────────────────────
@@ -298,6 +387,9 @@ class SnapshotService
 
     // ── Disk source backup (backend-agnostic, always Flysystem) ──────────────
 
+    /**
+     * @return int Number of files found in the source disk.
+     */
     private function backupDiskSource(
         string $sourceDiskName,
         string $backupDiskName,
@@ -305,7 +397,7 @@ class SnapshotService
         string $serverId,
         string $appName,
         string $currSlot,
-    ): void {
+    ): int {
         $sftpDestBase  = "{$serverId}/{$appName}/snapshots/disk-sources/{$sourceDiskName}/{$currSlot}";
         $remoteDestDir = ($ssh['root'] !== '' ? $ssh['root'] . '/' : '') . $sftpDestBase;
 
@@ -382,6 +474,8 @@ class SnapshotService
                 "disk-source backup failed: no files copied from {$sourceDiskName} ({$errors} errors)"
             );
         }
+
+        return $total;
     }
 
     /**

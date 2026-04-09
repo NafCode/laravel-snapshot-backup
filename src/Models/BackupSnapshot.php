@@ -15,6 +15,7 @@ class BackupSnapshot extends Model
         'snapshot_slot',
         'status',
         'size_bytes',
+        'file_count',
         'duration_seconds',
         'error_message',
         'rsync_stats',
@@ -23,6 +24,7 @@ class BackupSnapshot extends Model
     protected $casts = [
         'snapshot_date'    => 'date',
         'size_bytes'       => 'integer',
+        'file_count'       => 'integer',
         'duration_seconds' => 'integer',
     ];
 

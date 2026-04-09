@@ -10,7 +10,8 @@ Snapshot backup for Laravel applications. Backs up files and databases to remote
 - **Cloud disk backup** — S3, GCS, or any Laravel filesystem disk stream-copied alongside file snapshots, stored separately from the Borg repo
 - **Database dumps** — mysqldump piped through gzip, uploaded via rsync (SFTP disks) or Flysystem (S3, local, etc.)
 - **Multi-disk mirroring** — write to multiple backup destinations on every run
-- **Retention cleanup** — configurable per-type retention (files/DB: days-based; disk sources: slot-count)
+- **Retention cleanup** — configurable per-type retention (files/DB: days-based; disk sources: slot-count) with safe-cleanup guard
+- **Anomaly detection** — alerts on empty backups or >50% file count drop; retention freezes until source is restored
 - **Full restore** — files via rsync, database via `zcat | mysql`, with pre-restore failsafe dump
 - **Queue isolation** — backup jobs run on a dedicated queue, never blocking app workers
 - **Failure alerts** — synchronous email notifications when jobs exhaust all retries
@@ -480,6 +481,30 @@ HETZNER_PASSWORD=...
 | Database records | ~1 hour (every hour) |
 | Data older than 30 days | Permanent — not recoverable |
 | S3/disk-source data beyond 2 latest copies | Permanent — only 2 slots kept (configurable via `keep_disk_source_slots`) |
+
+---
+
+## Safe Cleanup & Anomaly Detection
+
+### Backup anomaly detection
+
+After each file backup, the system compares the current file count against the last successful backup:
+
+| File count | Status | Action |
+|------------|--------|--------|
+| 0 files | `empty` | Alert sent — source may have been deleted |
+| >50% drop | `warning` | Alert sent — significant data loss detected |
+| Normal | `success` | No alert; counted as a healthy backup |
+
+Anomaly alerts are sent via the `SnapshotBackupFailed` notification to `notifications.mail` recipients.
+
+### Safe cleanup (`safe_cleanup = true`, default)
+
+Before running any retention, the system checks if at least one `status = 'success'` file backup exists within the `keep_file_days` window. If not, **all retention is skipped** — old good backups are preserved indefinitely.
+
+This prevents silent data loss if the source (S3 bucket, local disk) is accidentally deleted. Without this guard, retention would delete all backups within `keep_file_days` days, leaving nothing to restore from.
+
+Once the source is restored and a healthy backup runs again (`success` status), retention resumes normally.
 
 ---
 
