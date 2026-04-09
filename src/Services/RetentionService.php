@@ -329,8 +329,25 @@ class RetentionService
     /**
      * Delete a directory tree via SSH rm -rf. Much faster than SFTP deleteDirectory
      * for directories with thousands of files.
+     *
+     * Hetzner restricted shell does not support shell operators (;, &&, ||, |)
+     * or redirects (2>/dev/null), so chmod and rm must be separate SSH calls.
      */
     private function sshRmRf(array $ssh, string $remotePath): bool
+    {
+        // Unlock first (non-fatal — may already be writable).
+        $this->sshExec($ssh, 'chmod -R u+w ' . escapeshellarg($remotePath));
+
+        // Delete.
+        $process = $this->sshExec($ssh, 'rm -rf ' . escapeshellarg($remotePath));
+
+        return $process->isSuccessful();
+    }
+
+    /**
+     * Execute a single command on the remote host via SSH.
+     */
+    private function sshExec(array $ssh, string $remoteCmd): Process
     {
         $sshCmd = ['ssh', '-p', (string) $ssh['port'],
             '-o', 'StrictHostKeyChecking=accept-new',
@@ -343,16 +360,10 @@ class RetentionService
             $sshCmd[] = 'BatchMode=yes';
         }
 
-        $userHost = "{$ssh['user']}@{$ssh['host']}";
-
-        // chmod first to remove read-only locks, then rm -rf.
-        $remoteCmd = "chmod -R u+w " . escapeshellarg($remotePath) . " 2>/dev/null; rm -rf " . escapeshellarg($remotePath);
-
-        $cmd = $sshCmd;
-        $cmd[] = $userHost;
+        $cmd   = $sshCmd;
+        $cmd[] = "{$ssh['user']}@{$ssh['host']}";
         $cmd[] = $remoteCmd;
 
-        // For password auth, prepend sshpass.
         if ($ssh['ssh_key'] === null && $ssh['password'] !== null) {
             array_unshift($cmd, 'sshpass', '-p', $ssh['password']);
         }
@@ -360,7 +371,7 @@ class RetentionService
         $process = new Process($cmd, null, null, null, 300);
         $process->run();
 
-        return $process->isSuccessful();
+        return $process;
     }
 
     // ── Borg helpers ──────────────────────────────────────────────────────────
