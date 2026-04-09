@@ -35,7 +35,7 @@ class RetentionService
             }
 
             $this->cleanupDbDays($diskName, $serverId, $appName);
-            $this->cleanupDiskSources($diskName, $serverId, $appName);
+            $this->cleanupDiskSources($diskName, $diskConfig, $serverId, $appName);
         }
     }
 
@@ -263,7 +263,7 @@ class RetentionService
 
     // ── Disk source retention ─────────────────────────────────────────────────
 
-    private function cleanupDiskSources(string $diskName, string $serverId, string $appName): void
+    private function cleanupDiskSources(string $diskName, array $diskConfig, string $serverId, string $appName): void
     {
         $keepSlots       = (int) ($this->config['retention']['keep_disk_source_slots'] ?? 2);
         $disk            = MediaService::disk($diskName);
@@ -274,6 +274,11 @@ class RetentionService
         } catch (\Throwable) {
             return;
         }
+
+        // Build SSH command for fast rm -rf (SFTP deleteDirectory is too slow for
+        // thousands of files — it walks each file individually over SFTP).
+        $ssh = ($diskConfig['driver'] ?? '') === 'sftp' ? $this->sshFromDiskConfig($diskConfig) : null;
+        $sshRoot = $ssh ? rtrim($ssh['root'] ?? '', '/') : '';
 
         foreach ($sourceDirs as $sourceDir) {
             $sourceDirName = basename($sourceDir);
@@ -294,7 +299,19 @@ class RetentionService
 
                 foreach ($toDelete as $slot) {
                     try {
-                        $disk->deleteDirectory("{$slotBase}/{$slot}");
+                        $deleted = false;
+
+                        // Prefer SSH rm -rf for SFTP disks — orders of magnitude faster.
+                        if ($ssh) {
+                            $remotePath = ($sshRoot !== '' ? $sshRoot . '/' : '') . "{$slotBase}/{$slot}";
+                            $deleted = $this->sshRmRf($ssh, $remotePath);
+                        }
+
+                        // Fallback to SFTP deleteDirectory if SSH failed or not available.
+                        if (!$deleted) {
+                            $disk->deleteDirectory("{$slotBase}/{$slot}");
+                        }
+
                         Log::channel('backup')->info(
                             "Deleted disk-source slot: {$sourceDirName}/{$slot} on disk:{$diskName}"
                         );
@@ -307,6 +324,43 @@ class RetentionService
             } catch (\Throwable) {
             }
         }
+    }
+
+    /**
+     * Delete a directory tree via SSH rm -rf. Much faster than SFTP deleteDirectory
+     * for directories with thousands of files.
+     */
+    private function sshRmRf(array $ssh, string $remotePath): bool
+    {
+        $sshCmd = ['ssh', '-p', (string) $ssh['port'],
+            '-o', 'StrictHostKeyChecking=accept-new',
+            '-o', 'ConnectTimeout=30',
+        ];
+
+        if ($ssh['ssh_key'] !== null) {
+            array_splice($sshCmd, 1, 0, ['-i', $ssh['ssh_key']]);
+            $sshCmd[] = '-o';
+            $sshCmd[] = 'BatchMode=yes';
+        }
+
+        $userHost = "{$ssh['user']}@{$ssh['host']}";
+
+        // chmod first to remove read-only locks, then rm -rf.
+        $remoteCmd = "chmod -R u+w " . escapeshellarg($remotePath) . " 2>/dev/null; rm -rf " . escapeshellarg($remotePath);
+
+        $cmd = $sshCmd;
+        $cmd[] = $userHost;
+        $cmd[] = $remoteCmd;
+
+        // For password auth, prepend sshpass.
+        if ($ssh['ssh_key'] === null && $ssh['password'] !== null) {
+            array_unshift($cmd, 'sshpass', '-p', $ssh['password']);
+        }
+
+        $process = new Process($cmd, null, null, null, 300);
+        $process->run();
+
+        return $process->isSuccessful();
     }
 
     // ── Borg helpers ──────────────────────────────────────────────────────────
