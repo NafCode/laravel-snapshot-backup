@@ -308,9 +308,7 @@ class SnapshotService
 
     private function borgRepoUrl(array $ssh, string $serverId, string $appName): string
     {
-        // rawurlencode handles spaces (e.g. APP_NAME="My App") in the SSH URL path.
-        return "ssh://{$ssh['user']}@{$ssh['host']}:{$ssh['port']}/./"
-            . rawurlencode($serverId) . '/' . rawurlencode($appName) . '/borg-repo';
+        return "ssh://{$ssh['user']}@{$ssh['host']}:{$ssh['port']}/./{$serverId}/{$appName}/borg-repo";
     }
 
     private function borgEnv(array $ssh): array
