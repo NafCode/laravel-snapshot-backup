@@ -241,6 +241,10 @@ class SnapshotService
 
         $this->borgInitIfNeeded($repoUrl, $borgEnv);
 
+        // Delete any existing archive for this slot so a re-run always produces a fresh backup.
+        $delete = new Process(['borg', 'delete', "{$repoUrl}::{$currSlot}"], null, $borgEnv, null, 120);
+        $delete->run(); // non-fatal — archive simply may not exist yet
+
         $cmd = ['borg', 'create', '--stats', '--compression', 'lz4'];
 
         foreach ($excludes as $pattern) {
