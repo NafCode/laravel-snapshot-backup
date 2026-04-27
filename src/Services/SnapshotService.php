@@ -282,11 +282,17 @@ class SnapshotService
 
     private function borgInitIfNeeded(string $repoUrl, array $borgEnv): void
     {
-        $info = new Process(['borg', 'info', $repoUrl], null, $borgEnv, null, 30);
-        $info->run();
+        try {
+            $info = new Process(['borg', 'info', $repoUrl], null, $borgEnv, null, $this->config['rsync']['ssh_timeout']);
+            $info->run();
 
-        if ($info->isSuccessful()) {
-            return;
+            if ($info->isSuccessful()) {
+                return;
+            }
+        } catch (\Symfony\Component\Process\Exception\ProcessTimedOutException) {
+            // Storage server can be slow at night — treat timeout as "status unknown"
+            // and fall through to borg init, which handles "already exists" gracefully.
+            Log::channel('backup')->warning("borg info timed out for {$repoUrl} — attempting init.");
         }
 
         Log::channel('backup')->info("Initializing new Borg repo: {$repoUrl}");
