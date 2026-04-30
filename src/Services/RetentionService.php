@@ -83,11 +83,12 @@ class RetentionService
         $backend    = $diskConfig['snapshot_backend'] ?? 'rsync';
 
         if ($backend === 'borg') {
-            return $this->listBorgSnapshots($diskName, $diskConfig, $serverId, $appName);
+            return $this->listBorgSnapshots($diskName, $diskConfig);
         }
 
+        $remotePath    = $this->config['remote_path'];
         $disk          = MediaService::disk($diskName);
-        $fileSlotsBase = "{$serverId}/{$appName}/snapshots/files";
+        $fileSlotsBase = "{$remotePath}/snapshots/files";
 
         $slots = collect($disk->directories($fileSlotsBase))
             ->map(fn ($d) => basename($d))
@@ -95,11 +96,11 @@ class RetentionService
             ->sortDesc()
             ->values();
 
-        return $slots->map(function (string $slot) use ($disk, $serverId, $appName) {
+        return $slots->map(function (string $slot) use ($disk, $remotePath) {
             $date    = substr($slot, 0, 10);
-            $dbBase  = "{$serverId}/{$appName}/snapshots/db/{$date}";
+            $dbBase  = "{$remotePath}/snapshots/db/{$date}";
             $dbDumps = count($disk->files($dbBase));
-            $size    = $this->directorySize($disk, "{$serverId}/{$appName}/snapshots/files/{$slot}");
+            $size    = $this->directorySize($disk, "{$remotePath}/snapshots/files/{$slot}");
 
             return compact('slot', 'date', 'dbDumps', 'size');
         })->all();
@@ -114,12 +115,12 @@ class RetentionService
         string $appName,
     ): void {
         $ssh      = $this->sshFromDiskConfig($diskConfig);
-        $repoUrl  = $this->borgRepoUrl($ssh, $serverId, $appName);
+        $repoUrl  = $this->borgRepoUrl($ssh);
         $borgEnv  = $this->borgEnv($ssh);
         $keepDays = $this->config['retention']['keep_file_days'];
 
         Log::channel('backup')->info(
-            "Borg prune disk:{$diskName} {$serverId}/{$appName} (keep={$keepDays} days)"
+            "Borg prune disk:{$diskName} path:{$this->config['remote_path']} (keep={$keepDays} days)"
         );
 
         $prune = new Process(
@@ -160,11 +161,9 @@ class RetentionService
     private function listBorgSnapshots(
         string $diskName,
         array $diskConfig,
-        string $serverId,
-        string $appName,
     ): array {
         $ssh     = $this->sshFromDiskConfig($diskConfig);
-        $repoUrl = $this->borgRepoUrl($ssh, $serverId, $appName);
+        $repoUrl = $this->borgRepoUrl($ssh);
         $borgEnv = $this->borgEnv($ssh);
 
         $process = new Process(['borg', 'list', '--short', $repoUrl], null, $borgEnv, null, 60);
@@ -179,13 +178,15 @@ class RetentionService
 
         $disk = MediaService::disk($diskName);
 
+        $remotePath = $this->config['remote_path'];
+
         return collect(explode("\n", trim($process->getOutput())))
             ->filter(fn ($s) => preg_match('/^\d{4}-\d{2}-\d{2}_\d{6}$/', $s))
             ->sortDesc()
             ->values()
-            ->map(function (string $slot) use ($disk, $serverId, $appName) {
+            ->map(function (string $slot) use ($disk, $remotePath) {
                 $date   = substr($slot, 0, 10);
-                $dbBase = "{$serverId}/{$appName}/snapshots/db/{$date}";
+                $dbBase = "{$remotePath}/snapshots/db/{$date}";
 
                 try {
                     $dbDumps = count($disk->files($dbBase));
@@ -205,10 +206,10 @@ class RetentionService
         $keepDays      = $this->config['retention']['keep_file_days'];
         $cutoff        = now()->subDays($keepDays)->format('Y-m-d_H0000');
         $disk          = MediaService::disk($diskName);
-        $fileSlotsBase = "{$serverId}/{$appName}/snapshots/files";
+        $fileSlotsBase = $this->config['remote_path'] . '/snapshots/files';
 
         Log::channel('backup')->info(
-            "File slot retention disk:{$diskName} {$serverId}/{$appName} (keep={$keepDays} days, cutoff={$cutoff})"
+            "File slot retention disk:{$diskName} (keep={$keepDays} days, cutoff={$cutoff})"
         );
 
         $slots = collect($disk->directories($fileSlotsBase))
@@ -250,10 +251,10 @@ class RetentionService
         $keepDays = $this->config['retention']['keep_db_days'];
         $cutoff   = now()->subDays($keepDays)->format('Y-m-d');
         $disk     = MediaService::disk($diskName);
-        $dbBase   = "{$serverId}/{$appName}/snapshots/db";
+        $dbBase   = $this->config['remote_path'] . '/snapshots/db';
 
         Log::channel('backup')->info(
-            "DB day retention disk:{$diskName} {$serverId}/{$appName} (keep={$keepDays} days, cutoff={$cutoff})"
+            "DB day retention disk:{$diskName} (keep={$keepDays} days, cutoff={$cutoff})"
         );
 
         $days = collect($disk->directories($dbBase))
@@ -295,7 +296,7 @@ class RetentionService
     {
         $keepSlots       = (int) ($this->config['retention']['keep_disk_source_slots'] ?? 2);
         $disk            = MediaService::disk($diskName);
-        $diskSourcesBase = "{$serverId}/{$appName}/snapshots/disk-sources";
+        $diskSourcesBase = $this->config['remote_path'] . '/snapshots/disk-sources';
 
         try {
             $sourceDirs = $disk->directories($diskSourcesBase);
@@ -331,8 +332,8 @@ class RetentionService
 
                         // Prefer SSH rm -rf for SFTP disks — orders of magnitude faster.
                         if ($ssh) {
-                            $remotePath = ($sshRoot !== '' ? $sshRoot . '/' : '') . "{$slotBase}/{$slot}";
-                            $deleted = $this->sshRmRf($ssh, $remotePath);
+                            $sshSlotPath = ($sshRoot !== '' ? $sshRoot . '/' : '') . "{$slotBase}/{$slot}";
+                            $deleted = $this->sshRmRf($ssh, $sshSlotPath);
                         }
 
                         // Fallback to SFTP deleteDirectory if SSH failed or not available.
@@ -404,9 +405,10 @@ class RetentionService
 
     // ── Borg helpers ──────────────────────────────────────────────────────────
 
-    private function borgRepoUrl(array $ssh, string $serverId, string $appName): string
+    private function borgRepoUrl(array $ssh): string
     {
-        return "ssh://{$ssh['user']}@{$ssh['host']}:{$ssh['port']}/./{$serverId}/{$appName}/borg-repo";
+        $remotePath = $this->config['remote_path'];
+        return "ssh://{$ssh['user']}@{$ssh['host']}:{$ssh['port']}/./{$remotePath}/borg-repo";
     }
 
     private function borgEnv(array $ssh): array

@@ -64,7 +64,8 @@ class SnapshotBackupRestoreCommand extends Command
         $diskConfig = config("filesystems.disks.{$diskName}");
         $backend    = $diskConfig['snapshot_backend'] ?? 'rsync';
 
-        $snapshotsBase = "{$serverId}/{$appName}/snapshots";
+        $remotePath    = $this->config['remote_path'];
+        $snapshotsBase = "{$remotePath}/snapshots";
         $fileSlotsBase = "{$snapshotsBase}/files";
         $dbBase        = "{$snapshotsBase}/db";
 
@@ -90,13 +91,13 @@ class SnapshotBackupRestoreCommand extends Command
         } else {
             if ($backend === 'borg') {
                 $ssh     = $this->sshFromDisk($diskConfig);
-                $repoUrl = $this->borgRepoUrl($ssh, $serverId, $appName);
+                $repoUrl = $this->borgRepoUrl($ssh);
                 $borgEnv = $this->borgEnv($ssh);
 
                 $allSlots = $this->listBorgArchives($repoUrl, $borgEnv);
 
                 if ($allSlots->isEmpty()) {
-                    $this->error("No Borg archives found in repo for {$serverId}/{$appName}.");
+                    $this->error("No Borg archives found in repo: {$repoUrl}.");
                     return self::FAILURE;
                 }
             } else {
@@ -214,7 +215,7 @@ class SnapshotBackupRestoreCommand extends Command
                 $this->line('No source disks configured — skipping disk restore.');
             } else {
                 foreach ($sourceDiskNames as $sourceDiskName) {
-                    $sftpSlotDir = "{$serverId}/{$appName}/snapshots/disk-sources/{$sourceDiskName}/{$fileSlot}";
+                    $sftpSlotDir = "{$remotePath}/snapshots/disk-sources/{$sourceDiskName}/{$fileSlot}";
 
                     if (!$disk->directoryExists($sftpSlotDir)) {
                         $this->warn("No backup found for disk '{$sourceDiskName}' in slot {$fileSlot} — skipping.");
@@ -536,9 +537,10 @@ class SnapshotBackupRestoreCommand extends Command
             ->values();
     }
 
-    private function borgRepoUrl(array $ssh, string $serverId, string $appName): string
+    private function borgRepoUrl(array $ssh): string
     {
-        return "ssh://{$ssh['user']}@{$ssh['host']}:{$ssh['port']}/./{$serverId}/{$appName}/borg-repo";
+        $remotePath = $this->config['remote_path'];
+        return "ssh://{$ssh['user']}@{$ssh['host']}:{$ssh['port']}/./{$remotePath}/borg-repo";
     }
 
     private function borgEnv(array $ssh): array

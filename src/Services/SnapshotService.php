@@ -67,14 +67,14 @@ class SnapshotService
                     $ssh = $this->sshFromDiskConfig($diskName, $diskConfig);
 
                     if ($backend === 'borg') {
-                        $sizeBytes = $this->runBorgBackup($ssh, $diskName, $serverId, $appName, $currSlot);
+                        $sizeBytes = $this->runBorgBackup($ssh, $diskName, $currSlot);
                     } else {
-                        $sizeBytes = $this->runRsyncSnapshot($ssh, $diskName, $serverId, $appName, $currSlot);
+                        $sizeBytes = $this->runRsyncSnapshot($ssh, $diskName, $currSlot);
                     }
 
                     // Disk sources (S3, GCS, etc.) — always via Flysystem, separate from file backend.
                     foreach ($this->config['source']['files']['disks'] ?? [] as $sourceDiskName) {
-                        $fileCount += $this->backupDiskSource($sourceDiskName, $diskName, $ssh, $serverId, $appName, $currSlot);
+                        $fileCount += $this->backupDiskSource($sourceDiskName, $diskName, $ssh, $currSlot);
                     }
 
                     // Count local include paths for borg/rsync file count.
@@ -216,28 +216,25 @@ class SnapshotService
     private function runBorgBackup(
         array $ssh,
         string $diskName,
-        string $serverId,
-        string $appName,
         string $currSlot,
     ): ?int {
-        $includes = $this->config['source']['files']['include'];
-        $excludes = $this->config['source']['files']['exclude'];
+        $includes   = $this->config['source']['files']['include'];
+        $excludes   = $this->config['source']['files']['exclude'];
+        $remotePath = $this->config['remote_path'];
 
         if (empty($includes)) {
-            // No local paths configured (e.g. cloud storage mode — uploads go to S3).
-            // Skip borg entirely; disk-sources backup still runs in the caller.
             Log::channel('backup')->info(
-                "borg create skipped disk:{$diskName} {$serverId}/{$appName} — no local paths configured."
+                "borg create skipped disk:{$diskName} path:{$remotePath} — no local paths configured."
             );
             return null;
         }
 
-        $repoUrl = $this->borgRepoUrl($ssh, $serverId, $appName);
+        $repoUrl = $this->borgRepoUrl($ssh);
         $borgEnv = $this->borgEnv($ssh);
 
         // Borg cannot init a repo if the parent directory doesn't exist.
         // Create it via SSH before the first init attempt.
-        $this->remoteExec($ssh, 'mkdir -p ' . escapeshellarg('./' . $serverId . '/' . $appName), false);
+        $this->remoteExec($ssh, 'mkdir -p ' . escapeshellarg('./' . $remotePath), false);
 
         $this->borgInitIfNeeded($repoUrl, $borgEnv);
 
@@ -270,12 +267,11 @@ class SnapshotService
         }
 
         Log::channel('backup')->info(
-            "borg create SUCCESS disk:{$diskName} {$serverId}/{$appName}::{$currSlot}\n"
+            "borg create SUCCESS disk:{$diskName} path:{$remotePath}::{$currSlot}\n"
             . $process->getOutput()
         );
 
-        $dbBase = './' . $serverId . '/' . $appName . '/snapshots/db';
-        $this->remoteExec($ssh, "mkdir -p {$dbBase}", false);
+        $this->remoteExec($ssh, 'mkdir -p ' . escapeshellarg("./{$remotePath}/snapshots/db"), false);
 
         return null;
     }
@@ -316,9 +312,10 @@ class SnapshotService
         Log::channel('backup')->info("Borg repo initialized.");
     }
 
-    private function borgRepoUrl(array $ssh, string $serverId, string $appName): string
+    private function borgRepoUrl(array $ssh): string
     {
-        return "ssh://{$ssh['user']}@{$ssh['host']}:{$ssh['port']}/./{$serverId}/{$appName}/borg-repo";
+        $remotePath = $this->config['remote_path'];
+        return "ssh://{$ssh['user']}@{$ssh['host']}:{$ssh['port']}/./{$remotePath}/borg-repo";
     }
 
     private function borgEnv(array $ssh): array
@@ -355,13 +352,12 @@ class SnapshotService
     private function runRsyncSnapshot(
         array $ssh,
         string $diskName,
-        string $serverId,
-        string $appName,
         string $currSlot,
     ): ?int {
-        $remoteBase   = ($ssh['root'] !== '' ? $ssh['root'] . '/' : '') . $serverId . '/' . $appName;
+        $remotePath   = $this->config['remote_path'];
+        $remoteBase   = ($ssh['root'] !== '' ? $ssh['root'] . '/' : '') . $remotePath;
         $snapCurr     = $remoteBase . '/snapshots/files/' . $currSlot;
-        $sftpSnapCurr = $serverId . '/' . $appName . '/snapshots/files/' . $currSlot;
+        $sftpSnapCurr = $remotePath . '/snapshots/files/' . $currSlot;
 
         $this->remoteExec($ssh, "mkdir -p {$snapCurr}", false);
         $this->remoteExec($ssh, "chmod -R u+w {$snapCurr}", false);
@@ -404,11 +400,10 @@ class SnapshotService
         string $sourceDiskName,
         string $backupDiskName,
         array $ssh,
-        string $serverId,
-        string $appName,
         string $currSlot,
     ): int {
-        $sftpDestBase  = "{$serverId}/{$appName}/snapshots/disk-sources/{$sourceDiskName}/{$currSlot}";
+        $remotePath    = $this->config['remote_path'];
+        $sftpDestBase  = "{$remotePath}/snapshots/disk-sources/{$sourceDiskName}/{$currSlot}";
         $remoteDestDir = ($ssh['root'] !== '' ? $ssh['root'] . '/' : '') . $sftpDestBase;
 
         $sourceDisk = MediaService::disk($sourceDiskName);
@@ -419,7 +414,7 @@ class SnapshotService
 
         // Build an index of existing files in the previous slot (if any) for
         // incremental backup — skip files that haven't changed (same size).
-        $prevSlotFiles = $this->getPreviousSlotIndex($backupDisk, $serverId, $appName, $sourceDiskName, $currSlot);
+        $prevSlotFiles = $this->getPreviousSlotIndex($backupDisk, $sourceDiskName, $currSlot);
 
         $files   = $sourceDisk->allFiles();
         $total   = count($files);
@@ -495,12 +490,11 @@ class SnapshotService
      */
     private function getPreviousSlotIndex(
         $backupDisk,
-        string $serverId,
-        string $appName,
         string $sourceDiskName,
         string $currSlot,
     ): array {
-        $diskSourcesBase = "{$serverId}/{$appName}/snapshots/disk-sources/{$sourceDiskName}";
+        $remotePath      = $this->config['remote_path'];
+        $diskSourcesBase = "{$remotePath}/snapshots/disk-sources/{$sourceDiskName}";
 
         try {
             $slots = collect($backupDisk->directories($diskSourcesBase))

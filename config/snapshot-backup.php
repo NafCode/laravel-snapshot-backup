@@ -14,20 +14,33 @@ return [
 
     /*
     |--------------------------------------------------------------------------
-    | Server Identity
+    | Server Identity & Application Name
     |--------------------------------------------------------------------------
-    | Derived from APP_URL hostname — automatically unique per server.
-    | e.g. APP_URL=https://clinic-amsterdam.example.com
-    |      → server_id = clinic-amsterdam.example.com
+    | Used for database records, log messages, and alert emails only.
+    | NOT used for remote storage paths (see remote_path below).
     */
     'server_id' => parse_url(env('APP_URL'), PHP_URL_HOST),
+    'app_name'  => env('APP_NAME', 'app'),
 
     /*
     |--------------------------------------------------------------------------
-    | Application Name
+    | Remote Backup Path
     |--------------------------------------------------------------------------
+    | Fixed folder name on the SFTP sub-account root used for all backup
+    | storage. Since each server has its own sub-account, a short fixed name
+    | is safe and avoids spaces or special characters from APP_NAME breaking
+    | SSH / borg paths.
+    |
+    | Override with SNAPSHOT_BACKUP_REMOTE_PATH in .env if you need to
+    | match a pre-existing directory layout during migration.
+    |
+    | Remote layout:
+    |   {remote_path}/borg-repo
+    |   {remote_path}/snapshots/files/{slot}
+    |   {remote_path}/snapshots/db/{date}
+    |   {remote_path}/snapshots/disk-sources/{diskname}/{slot}
     */
-    'app_name' => env('APP_NAME', 'app'),
+    'remote_path' => env('SNAPSHOT_BACKUP_REMOTE_PATH', 'snapshot-backup'),
 
     /*
     |--------------------------------------------------------------------------
