@@ -46,7 +46,7 @@ class DatabaseDumpService
             $this->verifyGzip($localDump);
 
             $sizeBytes  = filesize($localDump);
-            $remotePath = "{$serverId}/{$appName}/snapshots/db/{$currDate}/" . basename($localDump);
+            $remotePath = $this->config['remote_path'] . "/snapshots/db/{$currDate}/" . basename($localDump);
             $failed     = [];
 
             foreach ($disks as $diskName) {
@@ -55,7 +55,7 @@ class DatabaseDumpService
                     if (($diskConfig['driver'] ?? '') === 'sftp') {
                         $ssh       = $this->sshFromDiskConfig($diskName, $diskConfig);
                         $remoteDir = ($ssh['root'] !== '' ? $ssh['root'] . '/' : '')
-                                   . "{$serverId}/{$appName}/snapshots/db/{$currDate}/";
+                                   . $this->config['remote_path'] . "/snapshots/db/{$currDate}/";
                         $this->uploadViaRsync($localDump, $ssh, $remoteDir);
                     } else {
                         $stream = fopen($localDump, 'r');

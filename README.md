@@ -73,7 +73,9 @@ SNAPSHOT_BACKUP_ENABLED=true
 SNAPSHOT_BACKUP_ALERT_MAIL=ops@example.com,devteam@example.com
 ```
 
-The `server_id` and `app_name` are derived automatically from `APP_URL` and `APP_NAME` — no extra config needed for basic usage.
+The `server_id` and `app_name` are derived from `APP_URL` and `APP_NAME` and are used for **database records, logs, and alerts only** — they are not used for remote storage paths.
+
+The remote storage path is controlled by `remote_path` (default `snapshot-backup`). Since each server has its own sub-account, a fixed folder name is safe and avoids issues with spaces or special characters in `APP_NAME`. Override with `SNAPSHOT_BACKUP_REMOTE_PATH` in `.env` if needed (e.g. to match a pre-existing layout during migration).
 
 ### Source files
 
@@ -308,7 +310,7 @@ php artisan snapshot-backup:cleanup --sync
 
 **Borg backend:**
 ```
-{server_id}/{app_name}/
+{remote_path}/                        ← fixed name (default: snapshot-backup)
 ├── borg-repo/                        ← Borg repository (managed by borg, not SFTP)
 ├── snapshots/
 │   ├── db/
@@ -324,7 +326,7 @@ php artisan snapshot-backup:cleanup --sync
 
 **rsync backend:**
 ```
-{server_id}/{app_name}/
+{remote_path}/                        ← fixed name (default: snapshot-backup)
 ├── latest -> snapshots/files/2026-04-06_060000   (symlink)
 └── snapshots/
     ├── files/

@@ -53,8 +53,6 @@ class SnapshotBackupRestoreCommand extends Command
     {
         $this->config = config('snapshot-backup');
 
-        $serverId     = $this->option('server') ?? $this->config['server_id'];
-        $appName      = $this->option('app')    ?? $this->config['app_name'];
         $includes     = $this->config['source']['files']['include'];
         $firstInclude = $includes[0] ?? null;
         $targetDir    = $this->option('target') ?? ($firstInclude ? dirname($firstInclude) : storage_path('app'));
