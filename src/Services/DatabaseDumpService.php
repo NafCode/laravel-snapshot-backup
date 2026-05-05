@@ -4,10 +4,13 @@ namespace SnapshotBackup\Services;
 
 use Illuminate\Support\Facades\Log;
 use SnapshotBackup\Models\BackupSnapshot;
+use SnapshotBackup\Traits\SanitizesProcessOutput;
 use Symfony\Component\Process\Process;
 
 class DatabaseDumpService
 {
+    use SanitizesProcessOutput;
+
     private array $config;
 
     public function __construct()
@@ -132,7 +135,7 @@ class DatabaseDumpService
         $process->run();
 
         if (!$process->isSuccessful()) {
-            throw new \RuntimeException('rsync DB upload failed: ' . trim($process->getErrorOutput()));
+            throw new \RuntimeException('rsync DB upload failed: ' . $this->sanitizeProcessOutput(trim($process->getErrorOutput()), $ssh));
         }
     }
 
@@ -160,7 +163,7 @@ class DatabaseDumpService
         }
 
         if (!$process->isSuccessful()) {
-            throw new \RuntimeException("SSH command failed: {$command}\n" . trim($process->getErrorOutput()));
+            throw new \RuntimeException("SSH command failed: {$command}\n" . $this->sanitizeProcessOutput(trim($process->getErrorOutput()), $ssh));
         }
     }
 

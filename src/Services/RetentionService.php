@@ -4,10 +4,13 @@ namespace SnapshotBackup\Services;
 
 use Illuminate\Support\Facades\Log;
 use SnapshotBackup\Models\BackupSnapshot;
+use SnapshotBackup\Traits\SanitizesProcessOutput;
 use Symfony\Component\Process\Process;
 
 class RetentionService
 {
+    use SanitizesProcessOutput;
+
     private array $config;
 
     public function __construct()
@@ -131,10 +134,10 @@ class RetentionService
 
         if (!$prune->isSuccessful()) {
             Log::channel('backup')->error(
-                "borg prune failed disk:{$diskName}: " . trim($prune->getErrorOutput())
+                "borg prune failed disk:{$diskName}: " . $this->sanitizeProcessOutput(trim($prune->getErrorOutput()), $ssh)
             );
         } else {
-            Log::channel('backup')->info("borg prune done disk:{$diskName}\n" . $prune->getOutput());
+            Log::channel('backup')->info("borg prune done disk:{$diskName}\n" . $this->sanitizeProcessOutput($prune->getOutput(), $ssh));
         }
 
         $compact = new Process(['borg', 'compact', $repoUrl], null, $borgEnv, null, 300);
@@ -142,7 +145,7 @@ class RetentionService
 
         if (!$compact->isSuccessful()) {
             Log::channel('backup')->error(
-                "borg compact failed disk:{$diskName}: " . trim($compact->getErrorOutput())
+                "borg compact failed disk:{$diskName}: " . $this->sanitizeProcessOutput(trim($compact->getErrorOutput()), $ssh)
             );
         } else {
             Log::channel('backup')->info("borg compact done disk:{$diskName}");
@@ -171,7 +174,7 @@ class RetentionService
 
         if (!$process->isSuccessful()) {
             Log::channel('backup')->error(
-                "borg list failed disk:{$diskName}: " . trim($process->getErrorOutput())
+                "borg list failed disk:{$diskName}: " . $this->sanitizeProcessOutput(trim($process->getErrorOutput()), $ssh)
             );
             return [];
         }

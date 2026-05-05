@@ -6,10 +6,13 @@ use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Notification;
 use SnapshotBackup\Models\BackupSnapshot;
 use SnapshotBackup\Services\MediaService;
+use SnapshotBackup\Traits\SanitizesProcessOutput;
 use Symfony\Component\Process\Process;
 
 class SnapshotService
 {
+    use SanitizesProcessOutput;
+
     private array $config;
 
     public function __construct()
@@ -236,7 +239,7 @@ class SnapshotService
         // Create it via SSH before the first init attempt.
         $this->remoteExec($ssh, 'mkdir -p ' . escapeshellarg('./' . $remotePath), false);
 
-        $this->borgInitIfNeeded($repoUrl, $borgEnv);
+        $this->borgInitIfNeeded($repoUrl, $borgEnv, $ssh);
 
         // Delete any existing archive for this slot so a re-run always produces a fresh backup.
         $delete = new Process(['borg', 'delete', "{$repoUrl}::{$currSlot}"], null, $borgEnv, null, 120);
@@ -260,15 +263,15 @@ class SnapshotService
         $exitCode = $process->getExitCode();
         if ($exitCode === 1) {
             Log::channel('backup')->warning(
-                "borg create warnings disk:{$diskName}: " . trim($process->getErrorOutput())
+                "borg create warnings disk:{$diskName}: " . $this->sanitizeProcessOutput(trim($process->getErrorOutput()), $ssh)
             );
         } elseif ($exitCode !== 0) {
-            throw new \RuntimeException('borg create failed: ' . trim($process->getErrorOutput()));
+            throw new \RuntimeException('borg create failed: ' . $this->sanitizeProcessOutput(trim($process->getErrorOutput()), $ssh));
         }
 
         Log::channel('backup')->info(
             "borg create SUCCESS disk:{$diskName} path:{$remotePath}::{$currSlot}\n"
-            . $process->getOutput()
+            . $this->sanitizeProcessOutput($process->getOutput(), $ssh)
         );
 
         $this->remoteExec($ssh, 'mkdir -p ' . escapeshellarg("./{$remotePath}/snapshots/db"), false);
@@ -276,7 +279,7 @@ class SnapshotService
         return null;
     }
 
-    private function borgInitIfNeeded(string $repoUrl, array $borgEnv): void
+    private function borgInitIfNeeded(string $repoUrl, array $borgEnv, array $ssh): void
     {
         try {
             $info = new Process(['borg', 'info', $repoUrl], null, $borgEnv, null, $this->config['rsync']['ssh_timeout']);
@@ -288,10 +291,10 @@ class SnapshotService
         } catch (\Symfony\Component\Process\Exception\ProcessTimedOutException) {
             // Storage server can be slow at night — treat timeout as "status unknown"
             // and fall through to borg init, which handles "already exists" gracefully.
-            Log::channel('backup')->warning("borg info timed out for {$repoUrl} — attempting init.");
+            Log::channel('backup')->warning("borg info timed out for [borg-repo] — attempting init.");
         }
 
-        Log::channel('backup')->info("Initializing new Borg repo: {$repoUrl}");
+        Log::channel('backup')->info("Initializing new Borg repo: [borg-repo]");
 
         $init = new Process(['borg', 'init', '--encryption=none', $repoUrl], null, $borgEnv, null, 60);
         $init->run();
@@ -302,11 +305,11 @@ class SnapshotService
             // "already exists" means borg info failed for a transient reason
             // (timeout, lock, etc.) but the repo is actually there — safe to continue.
             if (str_contains($stderr, 'already exists')) {
-                Log::channel('backup')->info("Borg repo already exists (borg info had failed): {$repoUrl}");
+                Log::channel('backup')->info("Borg repo already exists (borg info had failed): [borg-repo]");
                 return;
             }
 
-            throw new \RuntimeException('borg init failed: ' . $stderr);
+            throw new \RuntimeException('borg init failed: ' . $this->sanitizeProcessOutput($stderr, $ssh));
         }
 
         Log::channel('backup')->info("Borg repo initialized.");
@@ -376,7 +379,8 @@ class SnapshotService
                 $this->runWithRetry(
                     $rsyncCmd,
                     $this->config['rsync']['retry_count'],
-                    $this->config['rsync']['retry_delay']
+                    $this->config['rsync']['retry_delay'],
+                    $ssh
                 );
             }
 
@@ -617,7 +621,7 @@ class SnapshotService
         return implode(' ', $parts);
     }
 
-    private function runWithRetry(array $cmd, int $retries, int $delaySeconds): void
+    private function runWithRetry(array $cmd, int $retries, int $delaySeconds, array $ssh): void
     {
         $attempt   = 0;
         $lastError = null;
@@ -637,14 +641,14 @@ class SnapshotService
             }
 
             $lastError = "exit {$exitCode}: " . trim($process->getErrorOutput());
-            Log::channel('backup')->warning("rsync failed (attempt {$attempt}): {$lastError}");
+            Log::channel('backup')->warning("rsync failed (attempt {$attempt}): " . $this->sanitizeProcessOutput($lastError, $ssh));
 
             if ($attempt < $retries) {
                 sleep($delaySeconds);
             }
         }
 
-        throw new \RuntimeException("rsync failed after {$retries} attempts. Last: {$lastError}");
+        throw new \RuntimeException("rsync failed after {$retries} attempts. Last: " . $this->sanitizeProcessOutput((string) $lastError, $ssh));
     }
 
     private function remoteExec(array $ssh, string $command, bool $throwOnFailure = true): string
@@ -672,7 +676,7 @@ class SnapshotService
         }
 
         if ($throwOnFailure && !$process->isSuccessful()) {
-            throw new \RuntimeException("Remote command failed: {$command}\n" . $process->getErrorOutput());
+            throw new \RuntimeException("Remote command failed: {$command}\n" . $this->sanitizeProcessOutput(trim($process->getErrorOutput()), $ssh));
         }
 
         return $process->getOutput();
@@ -693,4 +697,5 @@ class SnapshotService
         preg_match('/Number of files transferred: \d+.*?Total transferred file size: [\d,]+ bytes/s', $rsyncOutput, $m);
         return $m[0] ?? $rsyncOutput;
     }
+
 }
