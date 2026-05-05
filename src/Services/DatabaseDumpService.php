@@ -149,8 +149,15 @@ class DatabaseDumpService
             ? array_merge(['ssh'], $sshArgs, [$ssh['user'] . '@' . $ssh['host'], $command])
             : array_merge(['sshpass', '-p', $ssh['password'], 'ssh'], $sshArgs, [$ssh['user'] . '@' . $ssh['host'], $command]);
 
-        $process = new Process($cmd, timeout: 30);
-        $process->run();
+        $process = new Process($cmd, timeout: $this->config['rsync']['ssh_timeout']);
+
+        try {
+            $process->run();
+        } catch (\Throwable) {
+            // Do not re-throw the original exception — it contains the full command
+            // including the sshpass -p PASSWORD argument in plain text.
+            throw new \RuntimeException("SSH command timed out or failed: {$command}");
+        }
 
         if (!$process->isSuccessful()) {
             throw new \RuntimeException("SSH command failed: {$command}\n" . trim($process->getErrorOutput()));
