@@ -242,8 +242,14 @@ class SnapshotService
         $this->borgInitIfNeeded($repoUrl, $borgEnv, $ssh);
 
         // Delete any existing archive for this slot so a re-run always produces a fresh backup.
-        $delete = new Process(['borg', 'delete', "{$repoUrl}::{$currSlot}"], null, $borgEnv, null, 120);
-        $delete->run(); // non-fatal — archive simply may not exist yet
+        try {
+            $delete = new Process(['borg', 'delete', "{$repoUrl}::{$currSlot}"], null, $borgEnv, null, $this->config['rsync']['ssh_timeout']);
+            $delete->run(); // non-fatal — archive simply may not exist yet
+        } catch (\Throwable) {
+            // Timeout or network error on delete is non-fatal — borg create will fail with
+            // "Archive already exists" if the slot is genuinely there, which we handle below.
+            Log::channel('backup')->warning("borg delete timed out for slot:{$currSlot} — continuing.");
+        }
 
         $cmd = ['borg', 'create', '--stats', '--compression', 'lz4'];
 
@@ -296,8 +302,12 @@ class SnapshotService
 
         Log::channel('backup')->info("Initializing new Borg repo: [borg-repo]");
 
-        $init = new Process(['borg', 'init', '--encryption=none', $repoUrl], null, $borgEnv, null, 60);
-        $init->run();
+        try {
+            $init = new Process(['borg', 'init', '--encryption=none', $repoUrl], null, $borgEnv, null, $this->config['rsync']['ssh_timeout']);
+            $init->run();
+        } catch (\Throwable) {
+            throw new \RuntimeException('borg init failed: connection timed out');
+        }
 
         if (!$init->isSuccessful()) {
             $stderr = trim($init->getErrorOutput());
