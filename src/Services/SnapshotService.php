@@ -267,6 +267,18 @@ class SnapshotService
         $process->run();
 
         $exitCode = $process->getExitCode();
+
+        // Stale lock left by an interrupted backup (e.g. during a network outage).
+        // Break it and retry once — safe because only one backup job runs per repo at a time.
+        if ($exitCode !== 0 && str_contains($process->getErrorOutput(), 'lock')) {
+            Log::channel('backup')->warning("borg create: stale lock detected disk:{$diskName} — breaking lock and retrying.");
+            $breakLock = new Process(['borg', 'break-lock', $repoUrl], null, $borgEnv, null, 60);
+            $breakLock->run();
+            $process = new Process($cmd, null, $borgEnv, null, $this->config['queue']['timeout']);
+            $process->run();
+            $exitCode = $process->getExitCode();
+        }
+
         if ($exitCode === 1) {
             Log::channel('backup')->warning(
                 "borg create warnings disk:{$diskName}: " . $this->sanitizeProcessOutput(trim($process->getErrorOutput()), $ssh)
