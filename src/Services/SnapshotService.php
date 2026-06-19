@@ -279,6 +279,17 @@ class SnapshotService
             $exitCode = $process->getExitCode();
         }
 
+        // Corrupt/incomplete repo — init was interrupted before the manifest was written.
+        // Delete the broken repo dir and re-init so the next create can succeed.
+        if ($exitCode !== 0 && str_contains($process->getErrorOutput(), 'no manifest')) {
+            Log::channel('backup')->warning("borg create: no manifest disk:{$diskName} — repo incomplete, deleting and re-initialising.");
+            $this->remoteExec($ssh, 'rm -rf ' . escapeshellarg('./' . $remotePath . '/borg-repo'), false);
+            $this->borgInitIfNeeded($repoUrl, $borgEnv, $ssh);
+            $process = new Process($cmd, null, $borgEnv, null, $this->config['queue']['timeout']);
+            $process->run();
+            $exitCode = $process->getExitCode();
+        }
+
         if ($exitCode === 1) {
             Log::channel('backup')->warning(
                 "borg create warnings disk:{$diskName}: " . $this->sanitizeProcessOutput(trim($process->getErrorOutput()), $ssh)
