@@ -380,6 +380,11 @@ class SnapshotService
             'BORG_RSH'        => $sshCmd,
             'BORG_PASSPHRASE' => '',
             'BORG_BASE_DIR'   => storage_path('app/snapshot-backup/borg'),
+            // Repos are deleted/re-created automatically on corruption (see "no manifest"
+            // handling above) and always live on our own Hetzner sub-account — running
+            // non-interactively means we must pre-approve these prompts ourselves.
+            'BORG_UNKNOWN_UNENCRYPTED_REPO_ACCESS_IS_OK' => 'yes',
+            'BORG_RELOCATED_REPO_ACCESS_IS_OK'           => 'yes',
         ];
     }
 
